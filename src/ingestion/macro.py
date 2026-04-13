@@ -1,22 +1,3 @@
-"""
-역할: 매크로·현물 관련 raw 테이블 적재 (1단계 수집).
-
-1) `load_exchange_rate`: Yahoo Finance BRL=X로 USD/BRL 일별 시세 → `raw_exchange_rate`
-2) `load_price_spot`: `raw_price_spot` 테이블 보장(빈 경우 생성).
-3) `load_worldbank_pink_sheet_soybean_oil`: World Bank Pink Sheet 엑셀
-   `data/raw/worldbank_commodity_monthly.xlsx` 시트 `Monthly Prices`에서 대두유(USD) 월별 적재.
-   CEPEA 등 다른 출처는 별도 적재 시 `source`로 구분(PK는 `date` 단일).
-4) `load_dollar_index`: Yahoo ``DX-Y.NYB`` → ``raw_dollar_index``
-5) `load_sunflower_oil`: 동일 엑셀에서 Sunflower oil 월별 → ``raw_sunflower_oil``
-6) `load_eia_biodiesel`: EIA DNAV XLS 월간 대두유 바이오연료 투입량 → ``raw_eia_biodiesel``
-
-Look-ahead bias (환율):
-- Yahoo 관측일 데이터는 해당 일자 확정분으로 본다. 주말·휴장일은 직전 관측일로 forward-fill 하며
-  `is_interpolated=1`로 표시한다 (신규 시장 정보 아님).
-- master_daily에서는 관측일만 쓸지·보간 행을 제외할지 정책으로 통제한다.
-- ffill은 과거→현재만 사용한다.
-"""
-
 from __future__ import annotations
 
 import re

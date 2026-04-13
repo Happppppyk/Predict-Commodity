@@ -1,10 +1,7 @@
-"""
-역할: pytorch-forecasting TemporalFusionTransformer로 master_daily 가격의 분위수(P5/P50/P95) 예측.
-레이어: 예측 모델 (3) — 단일 시계열(대두유) PoC.
-"""
-
 from __future__ import annotations
 
+import argparse
+import re
 import sqlite3
 import sys
 import warnings
@@ -19,7 +16,6 @@ import pandas as pd
 import torch
 import yaml
 
-# `src`를 path에 넣어 utils 로드 (스크립트 직접 실행 호환)
 _SRC_DIR = Path(__file__).resolve().parents[1]
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
@@ -33,21 +29,75 @@ from utils.plot_style import configure_matplotlib_korean
 
 configure_matplotlib_korean()
 
-# 프로젝트 루트: src/models → parents[2]
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "db" / "soybean.db"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "features.yaml"
 MODELS_DIR = PROJECT_ROOT / "models"
 NOTEBOOKS_DIR = PROJECT_ROOT / "notebooks"
 MODEL_CKPT_PATH = MODELS_DIR / "tft_v1.ckpt"
+TFT_MULTI_CKPT_PATH = MODELS_DIR / "tft_v2_multi.ckpt"
 
-VAL_DAYS = 120  # tail 전체: calibration + test
-CAL_DAYS = 90  # tail 중 앞 구간 (Conformal 보정 전용)
-TEST_DAYS = 30  # tail 중 뒤 구간 (평가 전용, 학습·보정 미사용)
+VAL_DAYS = 120
+CAL_DAYS = 90
+TEST_DAYS = 30
 MAX_ENCODER_LENGTH = 112
 MAX_PREDICTION_LENGTH = 28
+MIN_ENCODER_LENGTH_MULTI = 56
 
-# 미래에도 알려진 캘린더·계절 피처
+TFT_MULTI_KNOWN_REALS: list[str] = [
+    "month",
+    "quarter",
+    "is_harvest_season",
+    "days_to_next_harvest",
+    "is_wasde_week",
+]
+TFT_MULTI_UNKNOWN_REALS: list[str] = [
+    "price_lag_1",
+    "price_lag_7",
+    "return_7d",
+    "volatility_20d",
+    "price_to_ma30_ratio",
+    "usd_brl_lag_1",
+    "dxy_lag_1",
+    "fed_rate",
+    "vix_close",
+    "wti_lag_1",
+    "cftc_noncomm_net",
+    "wasde_soyoil_stock_to_use",
+    "crush_spread",
+]
+
+TFT_MULTI_TRAIN_LAST = pd.Timestamp("2023-12-31")
+TFT_MULTI_CAL_END = pd.Timestamp("2024-06-30")
+TFT_MULTI_TEST_START = pd.Timestamp("2024-07-01")
+
+_COMMODITY_SQL: list[tuple[str, str]] = [
+    (
+        "soybean_oil",
+        "SELECT date, close FROM raw_price_futures WHERE commodity = 'ZL=F' ORDER BY date",
+    ),
+    (
+        "crude_oil",
+        "SELECT date, close FROM raw_crude_oil WHERE commodity = 'CL=F' ORDER BY date",
+    ),
+    (
+        "soybean",
+        "SELECT date, close FROM raw_soybean_futures WHERE commodity = 'ZS=F' ORDER BY date",
+    ),
+    (
+        "soymeal",
+        "SELECT date, close FROM raw_soymeal_futures WHERE commodity = 'ZM=F' ORDER BY date",
+    ),
+    (
+        "canola",
+        "SELECT date, close FROM raw_canola_oil WHERE commodity = 'canola' ORDER BY date",
+    ),
+    (
+        "palm_oil",
+        "SELECT date, close FROM raw_palm_oil WHERE commodity = 'CPOc1' ORDER BY date",
+    ),
+]
+
 TIME_VARYING_KNOWN_REALS: list[str] = [
     "month",
     "week_of_year",
@@ -58,7 +108,6 @@ TIME_VARYING_KNOWN_REALS: list[str] = [
     "days_to_next_harvest",
 ]
 
-# 과거에만 관측되는 피처 (+ 타깃 price_close)
 TIME_VARYING_UNKNOWN_REALS: list[str] = [
     "price_to_ma7_ratio",
     "price_to_ma14_ratio",
@@ -104,7 +153,6 @@ def _load_yaml_config(config_path: Path | None = None) -> dict:
 
 
 def _select_accelerator() -> str:
-    """CUDA 있으면 cuda, 그 외는 cpu (MPS 미사용: pytorch-forecasting MPSNDArray 버퍼 이슈 회피)."""
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
@@ -124,19 +172,214 @@ def _move_batch_to_device(
     return out
 
 
+def calibrate_conformal_v2(
+    cal_residuals: np.ndarray | pd.Series,
+    *,
+    alpha: float = 0.85,
+) -> float:
+    r = np.asarray(cal_residuals, dtype=np.float64)
+    r = r[np.isfinite(r)]
+    if len(r) == 0:
+        return float("nan")
+    return float(np.quantile(r, alpha))
+
+
+def _conformal_v2_coverage_and_q(
+    soy_cal: pd.DataFrame,
+    soy_test: pd.DataFrame,
+    alpha: float,
+) -> tuple[float, float]:
+    residuals = np.abs(
+        soy_cal["p50"].to_numpy(dtype=np.float64)
+        - soy_cal["actual"].to_numpy(dtype=np.float64)
+    )
+    q = calibrate_conformal_v2(residuals, alpha=alpha)
+    bias = float(np.mean(soy_cal["p50"].to_numpy() - soy_cal["actual"].to_numpy()))
+    p50_raw = soy_test["p50"].to_numpy(dtype=np.float64)
+    actual = soy_test["actual"].to_numpy(dtype=np.float64)
+    p50_corr = p50_raw - bias
+    cov = float(np.mean((actual > p50_corr - q) & (actual < p50_corr + q)))
+    return cov, q
+
+
+def _min_alpha_conformal_v2_for_coverage(
+    soy_cal: pd.DataFrame,
+    soy_test: pd.DataFrame,
+    *,
+    target_coverage: float = 0.80,
+    lo: float = 1e-6,
+    hi: float = 1.0 - 1e-9,
+    iters: int = 48,
+) -> float | None:
+    def cov_at(a: float) -> float:
+        c, _ = _conformal_v2_coverage_and_q(soy_cal, soy_test, a)
+        return c
+
+    if cov_at(lo) >= target_coverage:
+        return float(lo)
+    if cov_at(hi) < target_coverage:
+        return None
+    left, right = lo, hi
+    for _ in range(iters):
+        mid = 0.5 * (left + right)
+        if cov_at(mid) >= target_coverage:
+            right = mid
+        else:
+            left = mid
+    return float(right)
+
+
+def _load_commodity_close_frame(conn: sqlite3.Connection, commodity: str, sql: str) -> pd.DataFrame:
+    d = pd.read_sql_query(sql, conn)
+    if d.empty and "WHERE commodity" in sql:
+        m = re.search(r"FROM\s+(\w+)", sql, flags=re.IGNORECASE)
+        table = m.group(1) if m else ""
+        if table:
+            d = pd.read_sql_query(f'SELECT date, close FROM "{table}" ORDER BY date', conn)
+    if d.empty:
+        return pd.DataFrame(columns=["date", "commodity", "close"])
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date", "close"])
+    d["close"] = pd.to_numeric(d["close"], errors="coerce")
+    d = d.dropna(subset=["close"])
+    return d.assign(commodity=commodity)[["date", "commodity", "close"]]
+
+
+def prepare_tft_multi_dataset(
+    db_path: str | Path,
+) -> tuple[TimeSeriesDataSet, TimeSeriesDataSet, TimeSeriesDataSet, pd.DataFrame, dict[int, str]]:
+    db = Path(db_path)
+    if not db.is_file():
+        raise FileNotFoundError(f"DB 없음: {db.resolve()}")
+
+    master_cols = list(dict.fromkeys(["date"] + TFT_MULTI_KNOWN_REALS + TFT_MULTI_UNKNOWN_REALS))
+
+    with sqlite3.connect(db) as conn:
+        schema = {str(r[1]) for r in conn.execute("PRAGMA table_info(master_daily)").fetchall()}
+        load_m = [c for c in master_cols if c in schema]
+        miss_m = [c for c in master_cols if c != "date" and c not in schema]
+        if miss_m:
+            warnings.warn(
+                f"master_daily에 없는 멀티 TFT 피처는 제외: {miss_m}",
+                UserWarning,
+                stacklevel=2,
+            )
+        qm = ", ".join(f'"{c}"' for c in load_m)
+        master = pd.read_sql_query(f"SELECT {qm} FROM master_daily ORDER BY date", conn)
+        master["date"] = pd.to_datetime(master["date"], errors="coerce")
+        master = master.dropna(subset=["date"])
+
+        wide: pd.DataFrame | None = None
+        for commodity, sql in _COMMODITY_SQL:
+            part = _load_commodity_close_frame(conn, commodity, sql)
+            if part.empty:
+                raise RuntimeError(f"{commodity}: 가격 데이터가 비어 있습니다.")
+            g = part.groupby("date", as_index=False)["close"].mean()
+            g = g.rename(columns={"close": commodity})
+            wide = g if wide is None else wide.merge(g, on="date", how="inner")
+
+    if wide is None or wide.empty:
+        raise RuntimeError("멀티 시계열 inner join 결과가 비어 있습니다.")
+
+    long = wide.melt(id_vars="date", var_name="commodity", value_name="price_close")
+    long = long.merge(master, on="date", how="inner")
+
+    long = long.sort_values(["commodity", "date"]).reset_index(drop=True)
+    gcols = long.groupby("commodity", sort=False)["price_close"]
+    long["price_lag_1"] = gcols.shift(1)
+    long["price_lag_7"] = gcols.shift(7)
+    long["return_7d"] = gcols.pct_change(7)
+    long["volatility_20d"] = long.groupby("commodity", sort=False)["price_close"].transform(
+        lambda s: s.pct_change(1).rolling(20, min_periods=5).std()
+    )
+    ma30 = long.groupby("commodity", sort=False)["price_close"].transform(
+        lambda s: s.rolling(30, min_periods=15).mean()
+    )
+    long["price_to_ma30_ratio"] = long["price_close"] / ma30.replace(0, np.nan)
+
+    udates = np.sort(long["date"].unique())
+    dmap = {pd.Timestamp(d): i for i, d in enumerate(udates)}
+    long["time_idx"] = long["date"].map(dmap).astype(np.int64)
+
+    for c in TFT_MULTI_KNOWN_REALS + TFT_MULTI_UNKNOWN_REALS:
+        if c not in long.columns:
+            continue
+        if str(long[c].dtype) in ("Int64", "Int32", "boolean"):
+            long[c] = long[c].astype(float)
+
+    req = [
+        "price_close",
+        "price_lag_1",
+        "price_lag_7",
+        "return_7d",
+        "volatility_20d",
+        "price_to_ma30_ratio",
+    ]
+    req += [c for c in TFT_MULTI_KNOWN_REALS + TFT_MULTI_UNKNOWN_REALS if c in long.columns]
+    long = long.dropna(subset=[c for c in req if c in long.columns]).reset_index(drop=True)
+
+    known_active = [c for c in TFT_MULTI_KNOWN_REALS if c in long.columns]
+    unk_extra = [c for c in TFT_MULTI_UNKNOWN_REALS if c in long.columns]
+    unknown_with_target = ["price_close"] + unk_extra
+
+    train_df = long.loc[long["date"] <= TFT_MULTI_TRAIN_LAST].copy()
+    if train_df.empty:
+        raise ValueError("멀티 TFT 학습 구간(train) 행이 없습니다.")
+
+    group_order = list(pd.unique(train_df["commodity"]))
+    group_idx_to_name = {i: n for i, n in enumerate(group_order)}
+
+    training = TimeSeriesDataSet(
+        train_df,
+        time_idx="time_idx",
+        target="price_close",
+        group_ids=["commodity"],
+        max_encoder_length=MAX_ENCODER_LENGTH,
+        min_encoder_length=MIN_ENCODER_LENGTH_MULTI,
+        max_prediction_length=MAX_PREDICTION_LENGTH,
+        static_categoricals=["commodity"],
+        time_varying_known_reals=known_active,
+        time_varying_unknown_reals=unknown_with_target,
+        add_relative_time_idx=True,
+        add_target_scales=True,
+        randomize_length=None,
+    )
+
+    first_pred_idx = int(long.loc[long["date"] > TFT_MULTI_TRAIN_LAST, "time_idx"].min())
+    cal_end_tidx = int(long.loc[long["date"] <= TFT_MULTI_CAL_END, "time_idx"].max())
+    test_start_tidx = int(long.loc[long["date"] >= TFT_MULTI_TEST_START, "time_idx"].min())
+
+    tail_windows = TimeSeriesDataSet.from_dataset(
+        training,
+        long,
+        stop_randomization=True,
+        predict=False,
+        min_prediction_idx=first_pred_idx,
+    )
+    calibration_dataset = tail_windows.filter(
+        lambda di: (di["time_idx_last"] <= cal_end_tidx).to_numpy(dtype=bool)
+    )
+    test_dataset = tail_windows.filter(
+        lambda di: (di["time_idx_first_prediction"] >= test_start_tidx).to_numpy(dtype=bool)
+    )
+
+    n_series = int(long["commodity"].nunique())
+    n_train_samples = len(training)
+    print(
+        f"[prepare_tft_multi_dataset] 품목={n_series} | 전체행={len(long):,} | "
+        f"학습 TimeSeriesDataSet 샘플={n_train_samples:,} | "
+        f"cal 윈도우={len(calibration_dataset):,} | test 윈도우={len(test_dataset):,} | "
+        f"날짜 {long['date'].min().date()} ~ {long['date'].max().date()}"
+    )
+    return training, calibration_dataset, test_dataset, long, group_idx_to_name
+
+
 def prepare_tft_dataset(
     db_path: str | Path,
     version: str = "v1_stationary",
     *,
     config_path: Path | None = None,
 ) -> tuple[TimeSeriesDataSet, TimeSeriesDataSet, TimeSeriesDataSet, pd.DataFrame]:
-    """
-    master_daily 로드 → time_idx 부여 → 학습 / calibration / test 분리.
-
-    - **train**: ``time_idx <= max - VAL_DAYS`` (기존과 동일)
-    - **calibration**: 마지막 VAL_DAYS일 중 앞 CAL_DAYS일에 대한 예측 윈도우 (Conformal ``q`` 전용)
-    - **test**: 마지막 TEST_DAYS일에 대한 예측 윈도우만 (학습·보정 미사용, 순서: train < cal < test)
-    """
     db = Path(db_path)
     if not db.is_file():
         raise FileNotFoundError(f"DB 없음: {db.resolve()}")
@@ -204,7 +447,6 @@ def prepare_tft_dataset(
         raise ValueError("CAL_DAYS + TEST_DAYS == VAL_DAYS 이어야 합니다.")
     train_df = raw.loc[raw["time_idx"] <= train_end].copy()
 
-    # 타깃은 unknown에 포함 (문서 규약)
     unknown_with_target = ["price_close"] + unknown_active
 
     training = TimeSeriesDataSet(
@@ -222,18 +464,15 @@ def prepare_tft_dataset(
         randomize_length=None,
     )
 
-    # 마지막 VAL_DAYS 구간에 디코더가 걸치는 윈도우 (이후 cal/test로 필터)
     tail_windows = TimeSeriesDataSet.from_dataset(
         training,
         raw,
         stop_randomization=True,
         min_prediction_idx=train_end + 1,
     )
-    # calibration: 디코더가 끝나는 시점이 cal_end 이하인 윈도우만 (tail 앞 CAL_DAYS일만 예측)
     calibration_dataset = tail_windows.filter(
         lambda di: (di["time_idx_last"] <= cal_end).to_numpy(dtype=bool)
     )
-    # test: 디코더의 첫 예측 시점이 test_start 이상 (마지막 TEST_DAYS일만 예측)
     test_dataset = tail_windows.filter(
         lambda di: (di["time_idx_first_prediction"] >= test_start).to_numpy(dtype=bool)
     )
@@ -250,7 +489,6 @@ def prepare_tft_dataset(
 
 
 def build_tft_model(training_dataset: TimeSeriesDataSet) -> TemporalFusionTransformer:
-    """TemporalFusionTransformer 구성 (QuantileLoss P5/P50/P95)."""
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
         learning_rate=0.03,
@@ -270,8 +508,8 @@ def train_tft(
     validation: TimeSeriesDataSet,
     *,
     tft: TemporalFusionTransformer | None = None,
+    max_epochs: int = 30,
 ) -> tuple[Trainer, TemporalFusionTransformer]:
-    """Lightning Trainer로 학습. 검증은 ``validation``(보통 calibration 분할)만 사용."""
     train_dl = training.to_dataloader(train=True, batch_size=64, num_workers=0)
     val_dl = validation.to_dataloader(train=False, batch_size=128, num_workers=0)
 
@@ -281,7 +519,7 @@ def train_tft(
     early_stop = EarlyStopping(monitor="val_loss", patience=8, mode="min")
 
     trainer = Trainer(
-        max_epochs=30,
+        max_epochs=max_epochs,
         gradient_clip_val=0.1,
         accelerator=accelerator,
         devices=1,
@@ -303,7 +541,6 @@ def train_tft(
 
 
 def _np_row_1d(a: np.ndarray, i: int, h: int) -> float:
-    """배치 디코더 셀 (i, h)의 단일 타깃값을 float로."""
     v = np.asarray(a[i, h]).ravel()
     return float(v[0]) if v.size else float("nan")
 
@@ -313,17 +550,12 @@ def _collect_validation_predictions(
     dataset: TimeSeriesDataSet,
     *,
     quiet: bool = False,
+    group_idx_to_name: dict[int, str] | None = None,
 ) -> pd.DataFrame:
-    """
-    dataloader 순회 + ``tft(x)`` / ``to_quantiles`` 로 분위수(저/중/고)·실제값 수집.
-
-    배치 타깃 ``y``는 ``__target__`` 기준 **원 스케일**이며, ``transform_output`` 분위수와
-    스케일이 일치한다. ``tft.predict`` 미사용으로 calibration/test 등 **연속** 수집이 가능하다.
-    """
     tft.eval()
     device = tft.device
     val_dl = dataset.to_dataloader(train=False, batch_size=128, num_workers=0)
-    rows: list[tuple[int, int, float, float, float, float]] = []
+    rows: list[tuple[int, int, float, float, float, float, str | None]] = []
     first_batch = True
 
     with torch.no_grad():
@@ -343,14 +575,15 @@ def _collect_validation_predictions(
             y_np = y[0].detach().cpu().numpy()
             dti = x["decoder_time_idx"].detach().cpu().numpy()
             lengths = x["decoder_lengths"].detach().cpu().numpy()
+            grp_tensor = x.get("groups")
+            if grp_tensor is not None and group_idx_to_name is not None:
+                grp_ids = grp_tensor.squeeze(-1).detach().cpu().numpy().astype(int)
+            else:
+                grp_ids = None
 
             if not quiet and first_batch:
-                print(
-                    "\n=== [collect] forward quantiles (첫 배치) — "
-                    "P50은 [:,:,1] (transform_output 경로) ==="
-                )
-                print(f"  output shape: {q_np.shape}  (마지막 축: q05, P50, q95)")
-                print("  첫 샘플 horizon 0~4 (q05 / P50 / q95 vs actual):")
+                print(f"[collect] q shape {q_np.shape}")
+                print("h=0..4 q05/P50/q95 vs actual:")
                 for h in range(min(5, q_np.shape[1])):
                     print(
                         f"    h={h}  q05={q_np[0, h, 0]:.6f}  P50={q_np[0, h, 1]:.6f}  "
@@ -359,6 +592,9 @@ def _collect_validation_predictions(
                 first_batch = False
 
             for i in range(q_np.shape[0]):
+                gname: str | None = None
+                if grp_ids is not None and group_idx_to_name is not None:
+                    gname = group_idx_to_name.get(int(grp_ids[i]))
                 for h in range(int(lengths[i])):
                     rows.append(
                         (
@@ -368,12 +604,13 @@ def _collect_validation_predictions(
                             float(q_np[i, h, 1]),
                             float(q_np[i, h, 2]),
                             _np_row_1d(y_np, i, h),
+                            gname,
                         )
                     )
 
     return pd.DataFrame(
         rows,
-        columns=["time_idx", "horizon", "p10", "p50", "p90", "actual"],
+        columns=["time_idx", "horizon", "p10", "p50", "p90", "actual", "commodity"],
     )
 
 
@@ -386,12 +623,6 @@ def evaluate_tft(
     *,
     plot_path: Path | None = None,
 ) -> dict[str, float]:
-    """
-    TFT 분위수 밴드 vs 실제: MAE·RMSE(P50), Coverage(저·고 분위수 구간).
-    ``eval_dataset``은 보통 **test** 분할. ``notebooks/tft_prediction.png`` 저장.
-
-    ``df_pred``가 있으면 재사용. 없으면 ``eval_dataset``에서 수집.
-    """
     NOTEBOOKS_DIR.mkdir(parents=True, exist_ok=True)
     out_plot = Path(plot_path) if plot_path is not None else NOTEBOOKS_DIR / "tft_prediction.png"
 
@@ -405,17 +636,15 @@ def evaluate_tft(
 
     mae = float(np.mean(np.abs(p50 - actual)))
     rmse = float(np.sqrt(np.mean((p50 - actual) ** 2)))
-    # 단조 위반 시에도 의미 있는 밴드로 coverage: 저·고 분위수를 정렬한 뒤 엄격한 내부 비율
     q_lo = np.minimum(p10, p90)
     q_hi = np.maximum(p10, p90)
     coverage = float(np.mean((actual > q_lo) & (actual < q_hi)))
 
-    print("\n=== TFT 테스트 지표 (test 구간, 전 호라이즌·샘플 평균) ===")
+    print("\n[TFT test metrics]")
     print(f"MAE (P50, test):      {mae:.4f}")
     print(f"RMSE (P50, test):     {rmse:.4f}")
     print(f"Coverage 분위수 밴드 (test): {coverage:.2%}")
 
-    # 동일 time_idx에서 여러 윈도우 평균 → 날짜 기준 라인 플롯
     df_pred["q_lo"] = df_pred[["p10", "p50", "p90"]].min(axis=1)
     df_pred["q_hi"] = df_pred[["p10", "p50", "p90"]].max(axis=1)
     agg = (
@@ -459,7 +688,6 @@ def evaluate_tft(
 def _price_close_std_for_time_idx_range(
     df_processed: pd.DataFrame, t_min: int, t_max: int
 ) -> float:
-    """``time_idx`` 구간 ``[t_min, t_max]`` 일별 ``price_close`` 표준편차 (표본, ddof=1)."""
     dfp = df_processed.sort_values("time_idx")
     s = dfp.loc[
         (dfp["time_idx"] >= t_min) & (dfp["time_idx"] <= t_max),
@@ -478,13 +706,6 @@ def calibrate_conformal(
     *,
     df_pred: pd.DataFrame | None = None,
 ) -> dict[str, float]:
-    """
-    **Calibration 분할만** 사용: 잔차 ``|actual - P50|``의 ``target_coverage`` 분위 ``q_base``에
-    변동성 비율(최근 test 구간 30일 ``price_close`` σ / calibration 구간 σ)을 곱한 ``q_adjusted``를
-    산출한다. test 라벨은 사용하지 않는다(가격 σ만 ``df_processed``의 test 구간 날짜로 계산).
-
-    반환 dict: ``q_base``, ``q_adjusted``, ``vol_ratio``, ``cal_vol``, ``test_vol_estimate`` 등.
-    """
     tft.eval()
     if df_pred is None:
         df_pred = _collect_validation_predictions(
@@ -547,13 +768,6 @@ def evaluate_tft_with_conformal(
     n_calibration_steps: int,
     plot_path: Path | None = None,
 ) -> dict[str, float]:
-    """
-    **Test 분할만**으로 평가.
-
-    - calibration에서 ``bias = mean(P50 - actual)`` → test에 ``P50_corrected = P50 - bias``.
-    - Conformal 기본: ``[P50_corrected ± q_base]``, 변동성 조정: ``[P50_corrected ± q_adjusted]``.
-    - ``notebooks/tft_conformal.png`` 저장.
-    """
     if df_pred is None:
         df_pred = _collect_validation_predictions(tft, test_dataset, quiet=True)
     tft.eval()
@@ -589,7 +803,7 @@ def evaluate_tft_with_conformal(
     coverage_tft = float(np.mean((actual > raw_lo) & (actual < raw_hi)))
 
     n_test = len(df_pred)
-    print("\n=== TFT + Conformal (test 전용 평가) ===")
+    print("\n[TFT + Conformal test]")
     print(f"[Calibration 구간] {n_calibration_steps:,}개 스텝으로 q·편향 보정")
     print(f"[Test 구간] {n_test:,}개 스텝 (편향 mean(P50−actual)={bias:+.4f} 달러)")
     print(f"MAE (P50, 보정 전):     {mae_p50_raw:.4f} 달러")
@@ -692,7 +906,6 @@ def evaluate_tft_with_conformal(
 def _aggregate_interpretation(
     tft: TemporalFusionTransformer, validation: TimeSeriesDataSet
 ) -> dict[str, torch.Tensor]:
-    """검증 배치 전체에 대해 interpret_output을 합산 후 배치 수로 나눔."""
     tft.eval()
     device = tft.device
     val_dl = validation.to_dataloader(train=False, batch_size=64, num_workers=0)
@@ -727,7 +940,6 @@ def get_tft_attention(
     *,
     out_path: Path | None = None,
 ) -> None:
-    """시간 어텐션 가중치 평균을 히트맵으로 저장."""
     NOTEBOOKS_DIR.mkdir(parents=True, exist_ok=True)
     path = Path(out_path) if out_path else NOTEBOOKS_DIR / "tft_attention.png"
 
@@ -735,7 +947,6 @@ def get_tft_attention(
     attn = intr["attention"].detach().cpu().float()
     attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-8)
 
-    # (time_positions,) 또는 (1, T) 형태 대응
     w = attn.numpy().ravel()
     n = len(w)
     plt.figure(figsize=(max(10, n * 0.15), 2.5))
@@ -756,7 +967,6 @@ def get_tft_variable_importance(
     *,
     out_path: Path | None = None,
 ) -> list[tuple[str, float]]:
-    """VSN 가중치(인코더+디코더) 합산 후 바 차트 및 상위 5개 출력."""
     NOTEBOOKS_DIR.mkdir(parents=True, exist_ok=True)
     path = Path(out_path) if out_path else NOTEBOOKS_DIR / "tft_variable_importance.png"
 
@@ -766,7 +976,6 @@ def get_tft_variable_importance(
     enc_names = list(tft.encoder_variables)
     dec_names = list(tft.decoder_variables)
 
-    # 이름 길이 맞춤
     enc_w = enc_w[: len(enc_names)]
     dec_w = dec_w[: len(dec_names)]
 
@@ -792,7 +1001,7 @@ def get_tft_variable_importance(
 
     top5_idx = np.argsort(-scores)[:5]
     top5 = [(names[i], float(scores[i])) for i in top5_idx]
-    print("\n=== Variable importance 상위 5개 ===")
+    print("\n[Variable importance top 5]")
     for rank, (nm, sc) in enumerate(top5, start=1):
         print(f"  {rank}. {nm}: {sc * 100:.2f}%")
     return top5
@@ -804,9 +1013,6 @@ def _diagnose_conformal_coverage_gap(
     *,
     q_half_width: float,
 ) -> None:
-    """
-    Conformal test Coverage가 낮을 때 원인 파악용: 구간별 가격 변동성, P50 vs 실제, q vs test 잔차.
-    """
     max_t = int(df_processed["time_idx"].max())
     train_end = max_t - VAL_DAYS
     cal_end = train_end + CAL_DAYS
@@ -832,7 +1038,7 @@ def _diagnose_conformal_coverage_gap(
     cal_std, cal_mad = _vol_stats(cal_px)
     test_std, test_mad = _vol_stats(test_px)
 
-    print("\n========== [진단] calibration vs test 가격 변동성 ==========")
+    print("\n[진단] calibration vs test 변동성")
     print(
         f"calibration 구간: time_idx {train_end + 1}~{cal_end} ({CAL_DAYS}일, "
         f"일별 price_close {len(cal_px)}개)"
@@ -855,7 +1061,7 @@ def _diagnose_conformal_coverage_gap(
     act = dt["actual"].to_numpy(dtype=float)
     signed_err = p50 - act
 
-    print("\n========== [진단] test P50 vs 실제 (첫 10 스텝) ==========")
+    print("\n[진단] test P50 vs actual (10행)")
     print(f"{'idx':>4} {'time_idx':>9} {'h':>3} {'P50':>10} {'actual':>10} {'P50-actual':>12}")
     for k in range(min(10, len(dt))):
         r = dt.iloc[k]
@@ -864,10 +1070,7 @@ def _diagnose_conformal_coverage_gap(
             f"{float(r['p50']):10.4f} {float(r['actual']):10.4f} "
             f"{float(r['p50'] - r['actual']):12.4f}"
         )
-    print(
-        f"전체 test 스텝 편향: mean(P50−actual) = {float(np.mean(signed_err)):.4f} "
-        f"(>0 이면 P50이 실제보다 높게 치우침)"
-    )
+    print(f"전체 test mean(P50−actual) = {float(np.mean(signed_err)):.4f}")
 
     NOTEBOOKS_DIR.mkdir(parents=True, exist_ok=True)
     scatter_path = NOTEBOOKS_DIR / "tft_debug_p50_vs_actual_test.png"
@@ -897,20 +1100,16 @@ def _diagnose_conformal_coverage_gap(
     rank = int(np.searchsorted(sorted_r, q_half_width, side="right"))
     pct_in_test = 100.0 * rank / float(len(sorted_r)) if len(sorted_r) else float("nan")
 
-    print("\n========== [진단] Conformal q vs test 잔차 ==========")
+    print("\n[진단] Conformal q vs test 잔차")
     print(f"calibration에서 계산된 q (반폭): {q_half_width:.4f} 달러")
     print(
         f"test 구간 |actual−P50|: mean={r_mean:.4f}, std={r_std:.4f}, "
         f"80th pct={r_p80:.4f} 달러"
     )
-    print(
-        f"q는 test 잔차 분포에서 **경험적 상대 랭크 ≈ {pct_in_test:.1f}%** "
-        f"(잔차를 오름차순 정렬했을 때 q 이하인 비율×100; 80에 가까울수록 test에서도 비슷한 밴드)"
-    )
+    print(f"q 대비 test |actual−P50| 상대 랭크 ≈ {pct_in_test:.1f}%")
 
 
 def _naive_persistence_mae(df: pd.DataFrame, val_start_time_idx: int) -> float:
-    """검증 구간에서 전일 price_close로 당일을 맞출 때의 MAE (가격 스케일 참고)."""
     d = df.sort_values("time_idx").reset_index(drop=True)
     prev = d["price_close"].shift(1)
     mask = d["time_idx"] >= val_start_time_idx
@@ -919,13 +1118,126 @@ def _naive_persistence_mae(df: pd.DataFrame, val_start_time_idx: int) -> float:
     return float(err.mean()) if len(err) else float("nan")
 
 
+def run_tft_multi_eval_from_checkpoint(
+    db_path: str | Path | None = None,
+    ckpt_path: str | Path | None = None,
+) -> None:
+    db = Path(db_path) if db_path else DEFAULT_DB_PATH
+    ckpt = Path(ckpt_path) if ckpt_path else TFT_MULTI_CKPT_PATH
+    if not ckpt.is_file():
+        raise FileNotFoundError(f"체크포인트 없음: {ckpt.resolve()}")
+
+    _training, calibration_dataset, test_dataset, _df_long, group_idx_to_name = (
+        prepare_tft_multi_dataset(db)
+    )
+    acc = _select_accelerator()
+    tft = TemporalFusionTransformer.load_from_checkpoint(
+        str(ckpt),
+        map_location=acc,
+        weights_only=False,
+    )
+    tft.to(torch.device(acc))
+    tft.eval()
+
+    df_cal = _collect_validation_predictions(
+        tft,
+        calibration_dataset,
+        quiet=True,
+        group_idx_to_name=group_idx_to_name,
+    )
+    df_test = _collect_validation_predictions(
+        tft,
+        test_dataset,
+        quiet=True,
+        group_idx_to_name=group_idx_to_name,
+    )
+    soy_cal = df_cal.loc[df_cal["commodity"] == "soybean_oil"].copy()
+    soy_test = df_test.loc[df_test["commodity"] == "soybean_oil"].copy()
+    if soy_cal.empty or soy_test.empty:
+        raise RuntimeError("soybean_oil 평가용 예측 행이 비어 있습니다.")
+
+    for a in (0.85, 0.90):
+        cov, q = _conformal_v2_coverage_and_q(soy_cal, soy_test, a)
+        print(f"alpha={a:.2f}: Coverage {cov * 100:.2f}%, q=±{q:.2f}달러")
+
+    amin = _min_alpha_conformal_v2_for_coverage(soy_cal, soy_test, target_coverage=0.80)
+    if amin is None:
+        print("목표 80% 달성 최소 alpha: 달성 불가 (alpha 상한에서도 Coverage < 80%)")
+    else:
+        _, qm = _conformal_v2_coverage_and_q(soy_cal, soy_test, amin)
+        print(
+            f"목표 80% 달성 최소 alpha: {amin:.6f} (해당 q=±{qm:.2f}달러)"
+        )
+
+
+def run_tft_multi_pipeline(db_path: str | Path | None = None) -> dict[str, float]:
+    db = Path(db_path) if db_path else DEFAULT_DB_PATH
+    training, calibration_dataset, test_dataset, df_long, group_idx_to_name = prepare_tft_multi_dataset(
+        db
+    )
+    n_series = int(df_long["commodity"].nunique())
+    n_train_samples = len(training)
+    print(f"총 시계열 수: {n_series}")
+    print(f"총 학습 샘플 수: {n_train_samples:,}")
+
+    tft = build_tft_model(training)
+    trainer, tft = train_tft(
+        training, calibration_dataset, tft=tft, max_epochs=50
+    )
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    trainer.save_checkpoint(str(TFT_MULTI_CKPT_PATH))
+    print(f"[run_tft_multi_pipeline] 체크포인트 저장: {TFT_MULTI_CKPT_PATH.resolve()}")
+
+    df_cal = _collect_validation_predictions(
+        tft,
+        calibration_dataset,
+        quiet=True,
+        group_idx_to_name=group_idx_to_name,
+    )
+    df_test = _collect_validation_predictions(
+        tft,
+        test_dataset,
+        quiet=True,
+        group_idx_to_name=group_idx_to_name,
+    )
+
+    soy_cal = df_cal.loc[df_cal["commodity"] == "soybean_oil"].copy()
+    soy_test = df_test.loc[df_test["commodity"] == "soybean_oil"].copy()
+    if soy_cal.empty or soy_test.empty:
+        raise RuntimeError("soybean_oil 평가용 예측 행이 비어 있습니다.")
+
+    residuals = np.abs(soy_cal["p50"].to_numpy(dtype=np.float64) - soy_cal["actual"].to_numpy(dtype=np.float64))
+    q = calibrate_conformal_v2(residuals)
+    bias = float(np.mean(soy_cal["p50"].to_numpy() - soy_cal["actual"].to_numpy()))
+    p50_raw = soy_test["p50"].to_numpy(dtype=np.float64)
+    actual = soy_test["actual"].to_numpy(dtype=np.float64)
+    p50_corr = p50_raw - bias
+    coverage_v2 = float(np.mean((actual > p50_corr - q) & (actual < p50_corr + q)))
+    mae_p50 = float(np.mean(np.abs(p50_raw - actual)))
+
+    target_ok = coverage_v2 >= 0.80
+    print(f"\nMAE (P50, soybean_oil, test): {mae_p50:.2f} 달러")
+    print(f"Coverage (Conformal v2, test): {coverage_v2 * 100:.2f}%")
+    print(f"Conformal v2 q (±반폭): {q:.4f} 달러 | calibration 잔차 분위(alpha=0.85) 기반")
+    print(f"목표 80% 달성 여부: {'예' if target_ok else '아니오'}")
+
+    return {
+        "mae_p50_soybean_test": mae_p50,
+        "coverage_conformal_v2": coverage_v2,
+        "q_conformal_v2": q,
+        "bias_cal": bias,
+        "n_train_samples": float(n_train_samples),
+        "n_series": float(n_series),
+    }
+
+
 def run_tft_pipeline(
     db_path: str | Path | None = None,
     version: str = "v2_interview",
     *,
     config_path: Path | None = None,
 ) -> None:
-    """학습 → 평가 → 어텐션·변수중요도 → 체크포인트 저장 → 요약 출력."""
     db = Path(db_path) if db_path else DEFAULT_DB_PATH
     cfg = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
 
@@ -989,12 +1301,12 @@ def run_tft_pipeline(
     cov_cf_base = conf_metrics["coverage_conformal_base"] * 100.0
     cov_cf_vol = conf_metrics["coverage_conformal_vol"] * 100.0
 
-    print("\n========== TFT 최종 요약 ==========")
+    print("\n[TFT 요약]")
     print(f"MAE (P50, 보정 전, test):        {conf_metrics['mae_p50_raw']:.4f} 달러")
     print(f"MAE (P50, 편향 보정 후, test):   {conf_metrics['mae_p50_corrected']:.4f} 달러")
     print(f"Coverage (TFT 원본, test):       {cov_tft_band:.2f}%")
     print(f"Coverage (Conformal 기본, test): {cov_cf_base:.2f}%")
-    print(f"Coverage (Conformal 변동성조정, test): {cov_cf_vol:.2f}%  ← 목표 80%")
+    print(f"Coverage (Conformal 변동성조정, test): {cov_cf_vol:.2f}% (목표 80%)")
     print(f"보정 편향값:                     {conf_metrics['bias']:+.4f} 달러")
     print(f"변동성 조정 비율:                {vol_ratio:.4f}배")
     print("------------------------------------")
@@ -1015,21 +1327,17 @@ def run_tft_pipeline(
         f"변동성조정 {conf_metrics['mean_width_conformal_vol']:.4f}"
     )
     print(
-        "⚠️ 주의: train < calibration < test 시간 순서를 유지하세요 (Look-ahead Bias 방지)."
-    )
-    print(
-        "참고: XGBoost PoC는 분류이므로 MAE와 직접 비교되지 않습니다. "
-        f"test 구간 단순 지속(naive) price MAE ≈ {naive_mae:.4f}"
+        f"test naive persistence MAE ≈ {naive_mae:.4f}"
     )
     print("Variable importance 상위 3개 (calibration 기준):")
     for nm, sc in top5[:3]:
         print(f"  - {nm}: {sc * 100:.2f}%")
-    print("====================================\n")
+    print("")
 
     if version == "v2_interview":
         prev_cov = 51.79
         new_cov = cov_cf_vol
-        print("=== TFT v2_interview (t28) ===")
+        print("[TFT v2_interview]")
         print(f"MAE (P50, test): {conf_metrics['mae_p50_corrected']:.2f}달러")
         print(f"Coverage (Conformal 변동성조정, test): {new_cov:.2f}%")
         print(
@@ -1045,4 +1353,24 @@ if __name__ == "__main__":
         message="X does not have valid feature names",
         category=UserWarning,
     )
-    run_tft_pipeline()
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--train",
+        action="store_true",
+        help="전체 학습 파이프라인 실행 (체크포인트 덮어쓰기)",
+    )
+    ap.add_argument("--db", type=str, default=None, help="SQLite DB 경로 (기본: data/db/soybean.db)")
+    ap.add_argument(
+        "--ckpt",
+        type=str,
+        default=None,
+        help="평가용 체크포인트 (기본: models/tft_v2_multi.ckpt)",
+    )
+    args = ap.parse_args()
+    if args.train:
+        run_tft_multi_pipeline(Path(args.db) if args.db else None)
+    else:
+        run_tft_multi_eval_from_checkpoint(
+            Path(args.db) if args.db else None,
+            Path(args.ckpt) if args.ckpt else None,
+        )

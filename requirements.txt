@@ -12,6 +12,8 @@ requests
 numpy
 scikit-learn
 xgboost
+lightgbm
+catboost
 optuna
 torch
 pytorch-forecasting

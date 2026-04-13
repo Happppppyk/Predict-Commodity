@@ -1,13 +1,3 @@
-"""
-역할: `raw_*` 테이블을 조인·집계하여 일별 마스터 피처 `master_daily`를 빌드한다.
-레이어: master_daily 피처 빌드 (2) — `config/features.yaml`의 `active_version`과 연동.
-
-Look-ahead:
-- CFTC·WASDE·월별 spot·달러지수·카놀라·해바라기유는 공표일/월초·직전 관측 시점 값을 ZL 거래일 뼈대에 맞춘 뒤 **과거→현재 forward-fill**만 사용한다.
-- `report_date` 등 미래 정보로 조인하지 않는다.
-- 타깃(`target_price_t1`, `target_price_t7`, `target_price_t28`, …)은 **미래 가격**을 쓰므로 피처로 절대 사용하면 안 된다.
-"""
-
 from __future__ import annotations
 
 import re
@@ -827,6 +817,8 @@ def build_master_daily(
     - target_price_t1: t+1 거래일 종가 (shift -1)
     - target_price_t7, target_return_t7, target_updown_t7
     - target_price_t28, target_return_t28, target_updown_t28 (t+28 거래일)
+    - target_thresh_t7: t+7 수익률 > 2% 이면 1 (그 외 0, 미래 미정은 NA)
+    - target_thresh_t28: t+28 수익률 > 3% 이면 1 (그 외 0, 미래 미정은 NA)
 
     결측치는 임의 보간하지 않는다(CFTC·WASDE·spot의 ffill은 공표일 as-of 규칙).
 
@@ -916,6 +908,17 @@ def build_master_daily(
     tr28 = base["target_return_t28"]
     base["target_updown_t28"] = pd.Series(
         np.where(tr28.isna(), pd.NA, (tr28 > 0).astype(int)),
+        index=base.index,
+        dtype="Int64",
+    )
+
+    base["target_thresh_t7"] = pd.Series(
+        np.where(tr.isna(), pd.NA, (tr > 0.02).astype(int)),
+        index=base.index,
+        dtype="Int64",
+    )
+    base["target_thresh_t28"] = pd.Series(
+        np.where(tr28.isna(), pd.NA, (tr28 > 0.03).astype(int)),
         index=base.index,
         dtype="Int64",
     )

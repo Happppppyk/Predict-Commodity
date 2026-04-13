@@ -1,8 +1,3 @@
-"""
-역할: 저장된 XGBoost 모델 + master_daily에 대한 TreeSHAP·워터폴·의존성·What-if 반사실 분석.
-레이어: XAI (5) — notebooks/ 아래 PNG 및 콘솔 요약 출력.
-"""
-
 from __future__ import annotations
 
 import re

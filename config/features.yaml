@@ -1,6 +1,6 @@
 # master_daily 피처 버전 관리 (v1 → v2 → v3 확장)
 
-active_version: v1
+active_version: ensemble_v3_clean_t28
 
 versions:
   v1:
@@ -298,6 +298,7 @@ versions:
       v3_enhanced에서 결측/저기여 피처 제거.
       유효행 최대화 목표.
       t28 SHAP 상위 피처 중심으로 구성.
+      임계 타깃(target_thresh_t7/t28)은 라벨 실험용으로 컬럼에 포함.
     columns:
       - price_to_ma7_ratio
       - price_to_ma14_ratio
@@ -362,6 +363,223 @@ versions:
       - target_price_t28
       - target_return_t28
       - target_updown_t28
+      - target_thresh_t7
+      - target_thresh_t28
+      - feature_version
+    sources:
+      - raw_price_futures
+      - raw_exchange_rate
+      - raw_crude_oil
+      - raw_soybean_futures
+      - raw_soymeal_futures
+      - raw_palm_oil
+      - raw_cftc
+      - raw_wasde
+      - raw_price_spot
+      - raw_dollar_index
+      - raw_canola_oil
+      - raw_sunflower_oil
+      - raw_fed_rate
+      - raw_vix
+  v3_minimal_thresh:
+    description: |
+      v3_clean과 동일 피처·소스. 타깃에 임계 라벨(target_thresh_t7/t28) 포함.
+    columns:
+      - price_to_ma7_ratio
+      - price_to_ma14_ratio
+      - price_to_ma30_ratio
+      - return_1d
+      - return_3d
+      - return_7d
+      - return_14d
+      - volatility_5d
+      - volatility_10d
+      - volatility_20d
+      - usd_brl_lag_1
+      - usd_brl_return_7d
+      - usd_brl_volatility_14d
+      - wti_lag_1
+      - wti_return_7d
+      - wti_volatility_14d
+      - crush_spread
+      - crush_spread_ma7
+      - crush_spread_lag_1
+      - cftc_noncomm_net
+      - cftc_noncomm_net_chg_1w
+      - cftc_long_short_ratio
+      - cftc_percentile_52w
+      - wasde_soyoil_stock_to_use
+      - wasde_world_production
+      - month
+      - week_of_year
+      - quarter
+      - is_planting_season
+      - is_flowering_season
+      - is_harvest_season
+      - days_to_next_harvest
+      - dxy_close
+      - dxy_lag_1
+      - dxy_return_7d
+      - dxy_volatility_14d
+      - canola_close
+      - canola_lag_1
+      - sunflower_close
+      - market_avg_price_30d
+      - price_vs_market_avg
+      - fed_rate
+      - fed_rate_chg_1m
+      - fed_rate_chg_3m
+      - vix_close
+      - vix_lag_1
+      - vix_return_7d
+      - vix_regime
+      - momentum_accel_7d
+      - price_above_200d_ma
+      - wasde_release_day
+      - is_wasde_week
+      - days_to_wasde
+      - days_since_wasde
+      - is_cftc_release_day
+      - days_to_cftc
+      - target_price_t1
+      - target_price_t7
+      - target_return_t7
+      - target_updown_t7
+      - target_thresh_t7
+      - target_price_t28
+      - target_return_t28
+      - target_updown_t28
+      - target_thresh_t28
+      - feature_version
+    sources:
+      - raw_price_futures
+      - raw_exchange_rate
+      - raw_crude_oil
+      - raw_soybean_futures
+      - raw_soymeal_futures
+      - raw_palm_oil
+      - raw_cftc
+      - raw_wasde
+      - raw_price_spot
+      - raw_dollar_index
+      - raw_canola_oil
+      - raw_sunflower_oil
+      - raw_fed_rate
+      - raw_vix
+  v3_minimal:
+    description: |
+      t28 SHAP 상위 15개 피처만 (v3_clean 서브셋).
+    columns:
+      - fed_rate
+      - fed_rate_chg_1m
+      - fed_rate_chg_3m
+      - market_avg_price_30d
+      - price_vs_market_avg
+      - wasde_soyoil_stock_to_use
+      - vix_close
+      - vix_lag_1
+      - crush_spread_ma7
+      - usd_brl_lag_1
+      - usd_brl_volatility_14d
+      - wti_lag_1
+      - cftc_percentile_52w
+      - canola_lag_1
+      - dxy_lag_1
+      - target_price_t1
+      - target_price_t7
+      - target_return_t7
+      - target_updown_t7
+      - target_price_t28
+      - target_return_t28
+      - target_updown_t28
+      - target_thresh_t7
+      - target_thresh_t28
+      - feature_version
+    sources:
+      - raw_price_futures
+      - raw_exchange_rate
+      - raw_crude_oil
+      - raw_soybean_futures
+      - raw_soymeal_futures
+      - raw_palm_oil
+      - raw_cftc
+      - raw_wasde
+      - raw_price_spot
+      - raw_dollar_index
+      - raw_canola_oil
+      - raw_sunflower_oil
+      - raw_fed_rate
+      - raw_vix
+  ensemble_v3_clean_t28:
+    description: |
+      앙상블(XGBoost+LightGBM+CatBoost) 최종 추론용. master_daily 피처·소스는 v3_clean과 동일.
+      가중치: models/ensemble_v3_clean_t28_final/
+    columns:
+      - price_to_ma7_ratio
+      - price_to_ma14_ratio
+      - price_to_ma30_ratio
+      - return_1d
+      - return_3d
+      - return_7d
+      - return_14d
+      - volatility_5d
+      - volatility_10d
+      - volatility_20d
+      - usd_brl_lag_1
+      - usd_brl_return_7d
+      - usd_brl_volatility_14d
+      - wti_lag_1
+      - wti_return_7d
+      - wti_volatility_14d
+      - crush_spread
+      - crush_spread_ma7
+      - crush_spread_lag_1
+      - cftc_noncomm_net
+      - cftc_noncomm_net_chg_1w
+      - cftc_long_short_ratio
+      - cftc_percentile_52w
+      - wasde_soyoil_stock_to_use
+      - wasde_world_production
+      - month
+      - week_of_year
+      - quarter
+      - is_planting_season
+      - is_flowering_season
+      - is_harvest_season
+      - days_to_next_harvest
+      - dxy_close
+      - dxy_lag_1
+      - dxy_return_7d
+      - dxy_volatility_14d
+      - canola_close
+      - canola_lag_1
+      - sunflower_close
+      - market_avg_price_30d
+      - price_vs_market_avg
+      - fed_rate
+      - fed_rate_chg_1m
+      - fed_rate_chg_3m
+      - vix_close
+      - vix_lag_1
+      - vix_return_7d
+      - vix_regime
+      - momentum_accel_7d
+      - price_above_200d_ma
+      - wasde_release_day
+      - is_wasde_week
+      - days_to_wasde
+      - days_since_wasde
+      - is_cftc_release_day
+      - days_to_cftc
+      - target_price_t1
+      - target_price_t7
+      - target_return_t7
+      - target_updown_t7
+      - target_price_t28
+      - target_return_t28
+      - target_updown_t28
+      - target_thresh_t7
+      - target_thresh_t28
       - feature_version
     sources:
       - raw_price_futures

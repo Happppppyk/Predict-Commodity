@@ -1,18 +1,3 @@
-"""
-역할: USDA WASDE/PSD 계열 수급 지표를 `raw_wasde`에 적재한다.
-
-- `load_wasde_from_usda_api`: FAS Open Data PSD API (키 필요, https://apps.fas.usda.gov/opendataweb/home).
-- `load_wasde_from_csv`: 플랫 CSV 또는 `data/raw/wasde_psd.csv` 형식의 PSD Oilseeds 벌크 CSV.
-
-API 키: 프로젝트 루트 `.env` 파일의 `USDA_OPEN_DATA_API_KEY` 또는 동일 이름의 환경변수.
-(`python-dotenv` 설치 시 모듈 로드 시 `.env`를 자동 로드)
-
-⚠️ master_daily 조인·보간 (시계열 누수 방지):
-`raw_wasde`는 PK가 `(release_date, marketing_year)` 복합일 수 있음 — 조인 시 마케팅연도·공표일 정의를 맞출 것.
-release_date 기준으로만 master_daily에 조인할 것.
-월중 날짜에 forward-fill 적용 시 release 이후 날짜만 채울 것.
-"""
-
 from __future__ import annotations
 
 import json

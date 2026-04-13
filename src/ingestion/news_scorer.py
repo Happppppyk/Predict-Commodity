@@ -1,8 +1,3 @@
-"""
-역할: GDELT v2 DOC API로 뉴스를 수집하고, LLM 없이 규칙 기반으로 카테고리·스코어를 매겨 `raw_news_scored`에 적재한다.
-레이어: 데이터 수집 및 SQLite 적재 (1)
-"""
-
 from __future__ import annotations
 
 import json
@@ -14,8 +9,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-# --- 감성(상승=가격·리스크 상방에 가깝게 해석) 키워드 → SS ---
-# 상승 키워드: +0.6 ~ +1.0
 BULLISH_KEYWORD_SCORES: dict[str, float] = {
     "drought": 0.95,
     "ban": 0.85,
@@ -30,7 +23,6 @@ BULLISH_KEYWORD_SCORES: dict[str, float] = {
     "disruption": 0.65,
 }
 
-# 하락 키워드: -0.6 ~ -1.0
 BEARISH_PHRASE_SCORES: dict[str, float] = {
     "record harvest": -1.0,
     "weak demand": -0.85,
@@ -365,21 +357,15 @@ def run_news_pipeline(conn: sqlite3.Connection, days_back: int = 30) -> list[dic
     return scored
 
 
-# --- 하위 호환(초기 스켈레톤 이름) ---
-
-
 def ingest_news_batch(sources: list[str]) -> None:
-    """미사용. GDELT 단일 소스로 대체됨."""
     raise NotImplementedError("GDELT 파이프라인은 run_news_pipeline(conn)을 사용하세요.")
 
 
 def score_sentiment(text: str) -> float:
-    """제목 기준 규칙 기반 감성 점수 (카테고리 없이 SS만)."""
     return _sentiment_score_from_title(text)
 
 
 def persist_raw_news_scores(conn: sqlite3.Connection, records: list[dict]) -> None:
-    """load_news_to_db 별칭."""
     load_news_to_db(records, conn)
 
 

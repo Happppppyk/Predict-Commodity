@@ -1,17 +1,3 @@
-"""
-역할: CFTC Commitments of Traders 레거시(Non-commercial) 포지션 중 대두유(SOYBEAN OIL) 행을 수집해 `raw_cftc`에 적재한다.
-
-데이터 소스 (CFTC 공식):
-- `https://www.cftc.gov/dea/newcot/deacot.zip` 시도 (구 URL, 404일 수 있음).
-- 연도별 레거시 선물 ZIP `https://www.cftc.gov/files/dea/history/deacot{연도}.zip` (Historical Compressed).
-- 최신 스냅샷 `https://www.cftc.gov/dea/newcot/deafut.txt` (주간 1회 갱신, 이력 ZIP과 병합·중복 제거).
-
-⚠️ Look-ahead Bias 핵심 주의사항 (master_daily·모델링 시 반드시 준수):
-절대로 report_date 기준으로 forward-fill 하지 말 것.
-반드시 release_date(금요일) 기준으로만 master_daily에 조인할 것.
-화요일~목요일에 그 주 값을 쓰면 미래 정보 유출임.
-"""
-
 from __future__ import annotations
 
 import csv
@@ -227,7 +213,7 @@ def load_cftc(conn: sqlite3.Connection) -> int:
     """
     CFTC 데이터를 내려받아 `raw_cftc`에 INSERT OR IGNORE로 적재한다.
 
-    ⚠️ Look-ahead Bias 핵심 주의사항:
+    Look-ahead Bias 핵심 주의사항:
     절대로 report_date 기준으로 forward-fill 하지 말 것.
     반드시 release_date(금요일) 기준으로만 master_daily에 조인할 것.
     화요일~목요일에 그 주 값을 쓰면 미래 정보 유출임.

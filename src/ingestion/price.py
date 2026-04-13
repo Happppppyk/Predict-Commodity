@@ -1,16 +1,3 @@
-"""
-역할: Yahoo Finance에서 원유·대두·대두박·대두유(및 팜유 시도) 선물 OHLCV를 수집하고,
-Investing.com CPOc1 일별 CSV(`data/raw/palm_oil.csv`)를 `raw_palm_oil`에 적재한다.
-레이어: 데이터 수집 및 SQLite 적재 (1)
-
-Look-ahead bias 방지 (적재·이후 master_daily·모델링 시 공통 전제):
-- 일별 행은 해당 거래일에 확정된 OHLCV만 담는다. t일 피처에는 t일 종가가 장 마감 후 확정된 뒤에만 사용하고,
-  장중·미결제 봉을 미래 정보처럼 다루지 않는다.
-- master_daily·라벨은 항상 as-of t 시점에서 t 및 과거만 조인하고, t+1 이후 시세를 섞지 않는다.
-- INSERT OR IGNORE로 동일 date 재적재 시 기존 행을 덮어쓰지 않아 과거 스냅샷이 의도치 않게 바뀌지 않는다
-  (정정이 필요하면 별도 백필·마이그레이션으로 처리).
-"""
-
 from __future__ import annotations
 
 import logging

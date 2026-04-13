@@ -1,14 +1,3 @@
-"""
-역할: SAP에서 수동 추출한 엑셀(CSV 포함)을 SQLite `raw_sap_*` 테이블에 적재한다.
-레이어: 데이터 수집 및 SQLite 적재 (1) — 이후 Joule·master_daily와 정합을 맞춘다.
-
-공통:
-- 날짜 계열 컬럼은 자동으로 YYYY-MM-DD 문자열로 통일한다.
-- DB에 이미 있는 키는 제외하고 신규 행만 INSERT 한다.
-- 파일이 없으면 해당 raw 테이블 스키마만 생성하고 경고한다.
-- 기본 파일 탐색: 프로젝트 `data/raw/` 아래 고정 파일명(.xlsx → .xls → .csv 순 시도).
-"""
-
 from __future__ import annotations
 
 import sqlite3
