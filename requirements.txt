@@ -1,0 +1,40 @@
+# PoC 뼈대 — 실제 버전 핀은 구현 단계에서 고정
+# 데이터 / DB
+pandas
+pyyaml
+openpyxl
+xlrd>=2.0.1
+yfinance
+python-dotenv
+requests
+
+# ML 베이스라인 → 시계열 딥러닝
+numpy
+scikit-learn
+xgboost
+optuna
+torch
+pytorch-forecasting
+
+# RL / 환경 (구현 시 선택)
+gymnasium
+stable-baselines3
+
+# XAI
+shap
+
+# RAG / LLM (구현 시 선택)
+# sentence-transformers
+# chromadb
+
+# 시계열 검정 (master_daily ADF)
+statsmodels
+
+# 노트북·시각화
+nbformat>=4.2.0
+plotly
+matplotlib
+seaborn
+
+# 품질
+pytest

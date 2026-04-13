@@ -1,0 +1,380 @@
+# master_daily 피처 버전 관리 (v1 → v2 → v3 확장)
+
+active_version: v1
+
+versions:
+  v1:
+    description: "ZL 가격 + 환율(보간플래그) + WTI + 크러시 + CFTC + WASDE + spot/basis + 계절 + 타깃(t+1/t+7). (v1 컬럼 목록에서 팜유 파생 4열 제외)"
+    columns:
+      - price_close
+      - price_lag_1
+      - price_lag_3
+      - price_lag_7
+      - price_lag_14
+      - price_lag_30
+      - price_ma_7
+      - price_ma_14
+      - price_ma_30
+      - price_to_ma7_ratio
+      - price_to_ma14_ratio
+      - price_to_ma30_ratio
+      - return_1d
+      - return_3d
+      - return_7d
+      - return_14d
+      - volatility_5d
+      - volatility_10d
+      - volatility_20d
+      - usd_brl_close
+      - is_interpolated
+      - usd_brl_lag_1
+      - usd_brl_return_7d
+      - usd_brl_volatility_14d
+      - wti_close
+      - wti_lag_1
+      - wti_return_7d
+      - wti_volatility_14d
+      - crush_spread
+      - crush_spread_ma7
+      - crush_spread_lag_1
+      - cftc_noncomm_net
+      - cftc_noncomm_net_chg_1w
+      - cftc_long_short_ratio
+      - wasde_soyoil_stock_to_use
+      - wasde_soy_prod_brazil
+      - wasde_world_production
+      - spot_price_usd
+      - basis
+      - month
+      - week_of_year
+      - quarter
+      - is_planting_season
+      - is_flowering_season
+      - is_harvest_season
+      - days_to_next_harvest
+      - target_price_t1
+      - target_price_t7
+      - target_return_t7
+      - target_updown_t7
+      - feature_version
+    sources:
+      - raw_price_futures
+      - raw_exchange_rate
+      - raw_crude_oil
+      - raw_soybean_futures
+      - raw_soymeal_futures
+      - raw_palm_oil
+      - raw_cftc
+      - raw_wasde
+      - raw_price_spot
+  v1_stationary:
+    description: "v1 대비 비정상(레벨) 가격·환율·WTI 원시 시계열 제거. MA 대비 비율·수익률·변동성·스프레드·거시·계절 등 정상성 가정 파생만 사용 + 동일 타깃."
+    columns:
+      - price_to_ma7_ratio
+      - price_to_ma14_ratio
+      - price_to_ma30_ratio
+      - return_1d
+      - return_3d
+      - return_7d
+      - return_14d
+      - volatility_5d
+      - volatility_10d
+      - volatility_20d
+      - usd_brl_lag_1
+      - usd_brl_return_7d
+      - usd_brl_volatility_14d
+      - wti_lag_1
+      - wti_return_7d
+      - wti_volatility_14d
+      - crush_spread
+      - crush_spread_ma7
+      - crush_spread_lag_1
+      - cftc_noncomm_net
+      - cftc_noncomm_net_chg_1w
+      - cftc_long_short_ratio
+      - wasde_soyoil_stock_to_use
+      - wasde_soy_prod_brazil
+      - wasde_world_production
+      - month
+      - week_of_year
+      - quarter
+      - is_planting_season
+      - is_flowering_season
+      - is_harvest_season
+      - days_to_next_harvest
+      - target_price_t1
+      - target_price_t7
+      - target_return_t7
+      - target_updown_t7
+      - feature_version
+    sources:
+      - raw_price_futures
+      - raw_exchange_rate
+      - raw_crude_oil
+      - raw_soybean_futures
+      - raw_soymeal_futures
+      - raw_palm_oil
+      - raw_cftc
+      - raw_wasde
+      - raw_price_spot
+  v2_interview:
+    description: |
+      인터뷰 반영 버전 (2026).
+       - DXY 달러인덱스 추가 (BRL 대신 핵심 환율 지표)
+       - 대체 유지류 추가 (카놀라, 해바라기유)
+       - EIA 바이오디젤 추가 (RVO 정책 효과 반영)
+       - 시장평균 벤치마크 추가 (Reward 함수 기준)
+       - 타깃 t28 추가 (현업 의사결정 주기 1~1.5개월 반영)
+       - usd_brl은 보조 변수로 유지
+    columns:
+      - price_to_ma7_ratio
+      - price_to_ma14_ratio
+      - price_to_ma30_ratio
+      - return_1d
+      - return_3d
+      - return_7d
+      - return_14d
+      - volatility_5d
+      - volatility_10d
+      - volatility_20d
+      - usd_brl_lag_1
+      - usd_brl_return_7d
+      - usd_brl_volatility_14d
+      - wti_lag_1
+      - wti_return_7d
+      - wti_volatility_14d
+      - crush_spread
+      - crush_spread_ma7
+      - crush_spread_lag_1
+      - cftc_noncomm_net
+      - cftc_noncomm_net_chg_1w
+      - cftc_long_short_ratio
+      - wasde_soyoil_stock_to_use
+      - wasde_soy_prod_brazil
+      - wasde_world_production
+      - month
+      - week_of_year
+      - quarter
+      - is_planting_season
+      - is_flowering_season
+      - is_harvest_season
+      - days_to_next_harvest
+      - dxy_close
+      - dxy_lag_1
+      - dxy_return_7d
+      - dxy_volatility_14d
+      - canola_close
+      - canola_lag_1
+      - canola_return_7d
+      - sunflower_close
+      - sunflower_return_30d
+      - biodiesel_production_kbbl
+      - biodiesel_chg_4w
+      - market_avg_price_30d
+      - price_vs_market_avg
+      - target_price_t1
+      - target_price_t7
+      - target_return_t7
+      - target_updown_t7
+      - target_price_t28
+      - target_return_t28
+      - target_updown_t28
+      - feature_version
+    sources:
+      - raw_price_futures
+      - raw_exchange_rate
+      - raw_crude_oil
+      - raw_soybean_futures
+      - raw_soymeal_futures
+      - raw_palm_oil
+      - raw_cftc
+      - raw_wasde
+      - raw_price_spot
+      - raw_dollar_index
+      - raw_canola_oil
+      - raw_sunflower_oil
+      - raw_eia_biodiesel
+  v2:
+    description: "뉴스 스코어 통합"
+    columns: []
+    sources: []
+  v3:
+    description: "외부 매크로·파생 비율 확장"
+    columns: []
+    sources: []
+  v3_enhanced:
+    description: |
+      v3_enhanced 최종본.
+       - v2_interview 기반에서 WASDE/CFTC/팜유/카놀라 핵심 피처 복구
+       - FED 금리, VIX, 이벤트 캘린더(USDA/CFTC), 모멘텀/계절 조정/장기 MA 레짐 추가
+       - 결측이 큰 EIA 계열(soybean_oil_biofuel_mmlb, soybean_oil_biofuel_chg_3m) 제외
+    columns:
+      - price_to_ma7_ratio
+      - price_to_ma14_ratio
+      - price_to_ma30_ratio
+      - return_1d
+      - return_3d
+      - return_7d
+      - return_14d
+      - volatility_5d
+      - volatility_10d
+      - volatility_20d
+      - usd_brl_lag_1
+      - usd_brl_return_7d
+      - usd_brl_volatility_14d
+      - wti_lag_1
+      - wti_return_7d
+      - wti_volatility_14d
+      - crush_spread
+      - crush_spread_ma7
+      - crush_spread_lag_1
+      - cftc_noncomm_net
+      - cftc_noncomm_net_chg_1w
+      - cftc_long_short_ratio
+      - cftc_percentile_52w
+      - wasde_soyoil_stock_to_use
+      - wasde_soy_prod_brazil
+      - wasde_world_production
+      - month
+      - week_of_year
+      - quarter
+      - is_planting_season
+      - is_flowering_season
+      - is_harvest_season
+      - days_to_next_harvest
+      - dxy_close
+      - dxy_lag_1
+      - dxy_return_7d
+      - dxy_volatility_14d
+      - canola_close
+      - canola_lag_1
+      - canola_return_7d
+      - sunflower_close
+      - sunflower_return_30d
+      - market_avg_price_30d
+      - price_vs_market_avg
+      - palm_soyoil_spread
+      - fed_rate
+      - fed_rate_chg_1m
+      - fed_rate_chg_3m
+      - vix_close
+      - vix_lag_1
+      - vix_return_7d
+      - vix_regime
+      - momentum_accel_7d
+      - seasonal_adj_return_7d
+      - price_above_200d_ma
+      - wasde_release_day
+      - is_wasde_week
+      - days_to_wasde
+      - days_since_wasde
+      - is_cftc_release_day
+      - days_to_cftc
+      - target_price_t1
+      - target_price_t7
+      - target_return_t7
+      - target_updown_t7
+      - target_price_t28
+      - target_return_t28
+      - target_updown_t28
+      - feature_version
+    sources:
+      - raw_price_futures
+      - raw_exchange_rate
+      - raw_crude_oil
+      - raw_soybean_futures
+      - raw_soymeal_futures
+      - raw_palm_oil
+      - raw_cftc
+      - raw_wasde
+      - raw_price_spot
+      - raw_dollar_index
+      - raw_canola_oil
+      - raw_sunflower_oil
+      - raw_fed_rate
+      - raw_vix
+  v3_clean:
+    description: |
+      v3_enhanced에서 결측/저기여 피처 제거.
+      유효행 최대화 목표.
+      t28 SHAP 상위 피처 중심으로 구성.
+    columns:
+      - price_to_ma7_ratio
+      - price_to_ma14_ratio
+      - price_to_ma30_ratio
+      - return_1d
+      - return_3d
+      - return_7d
+      - return_14d
+      - volatility_5d
+      - volatility_10d
+      - volatility_20d
+      - usd_brl_lag_1
+      - usd_brl_return_7d
+      - usd_brl_volatility_14d
+      - wti_lag_1
+      - wti_return_7d
+      - wti_volatility_14d
+      - crush_spread
+      - crush_spread_ma7
+      - crush_spread_lag_1
+      - cftc_noncomm_net
+      - cftc_noncomm_net_chg_1w
+      - cftc_long_short_ratio
+      - cftc_percentile_52w
+      - wasde_soyoil_stock_to_use
+      - wasde_world_production
+      - month
+      - week_of_year
+      - quarter
+      - is_planting_season
+      - is_flowering_season
+      - is_harvest_season
+      - days_to_next_harvest
+      - dxy_close
+      - dxy_lag_1
+      - dxy_return_7d
+      - dxy_volatility_14d
+      - canola_close
+      - canola_lag_1
+      - sunflower_close
+      - market_avg_price_30d
+      - price_vs_market_avg
+      - fed_rate
+      - fed_rate_chg_1m
+      - fed_rate_chg_3m
+      - vix_close
+      - vix_lag_1
+      - vix_return_7d
+      - vix_regime
+      - momentum_accel_7d
+      - price_above_200d_ma
+      - wasde_release_day
+      - is_wasde_week
+      - days_to_wasde
+      - days_since_wasde
+      - is_cftc_release_day
+      - days_to_cftc
+      - target_price_t1
+      - target_price_t7
+      - target_return_t7
+      - target_updown_t7
+      - target_price_t28
+      - target_return_t28
+      - target_updown_t28
+      - feature_version
+    sources:
+      - raw_price_futures
+      - raw_exchange_rate
+      - raw_crude_oil
+      - raw_soybean_futures
+      - raw_soymeal_futures
+      - raw_palm_oil
+      - raw_cftc
+      - raw_wasde
+      - raw_price_spot
+      - raw_dollar_index
+      - raw_canola_oil
+      - raw_sunflower_oil
+      - raw_fed_rate
+      - raw_vix
