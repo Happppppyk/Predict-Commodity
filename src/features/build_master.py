@@ -871,6 +871,35 @@ def build_master_daily(
     else:
         base["basis"] = np.nan
 
+    # 멀티 시계열/TFT 공통 스케일 통일용(USD/ton)
+    base["soyoil_usd_per_ton"] = pc * 22.0462
+    if "wti_close" in base.columns:
+        base["wti_usd_per_ton"] = base["wti_close"].astype(float) * 6.2898
+    else:
+        base["wti_usd_per_ton"] = np.nan
+    if "zs_close" in base.columns:
+        base["soybean_usd_per_ton"] = base["zs_close"].astype(float) * (1.0 / 100.0) * 36.744
+    else:
+        base["soybean_usd_per_ton"] = np.nan
+    if "zm_close" in base.columns:
+        base["soymeal_usd_per_ton"] = base["zm_close"].astype(float) * 1.10231
+    else:
+        base["soymeal_usd_per_ton"] = np.nan
+    if "canola_close" in base.columns:
+        base["canola_usd_per_ton"] = base["canola_close"].astype(float) * 0.7285 * 1.10231
+    else:
+        base["canola_usd_per_ton"] = np.nan
+    # 팜유는 기존 palm_close를 유지하면서 요청 쿼리 호환용 palm_oil_close alias를 함께 둔다.
+    if "palm_oil_close" in base.columns:
+        palm_src = base["palm_oil_close"].astype(float)
+    elif "palm_close" in base.columns:
+        palm_src = base["palm_close"].astype(float)
+        base["palm_oil_close"] = palm_src
+    else:
+        palm_src = pd.Series(np.nan, index=base.index, dtype=float)
+    # CPOc1은 이미 USD/ton 스케일로 간주
+    base["palm_usd_per_ton"] = palm_src
+
     base["momentum_accel_7d"] = base["return_7d"] - base["return_14d"]
 
     if "cftc_noncomm_net" in base.columns:

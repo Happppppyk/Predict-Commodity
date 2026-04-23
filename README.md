@@ -5,9 +5,8 @@
 1. 데이터 수집 — `raw_*` 테이블 적재 (`src/ingestion/`)
 2. 피처 — `master_daily` 빌드 (`src/features/`, `config/features.yaml`)
 3. 예측 — XGBoost 베이스라인 → TFT (`src/models/`)
-4. 강화학습 — DQN 검증 → PPO 최적화 (`src/models/`)
+4. 시나리오·권고 — TFT 예측 기반 조달 의사결정 (`src/rl/scenario_engine.py`)
 5. XAI — SHAP + Counterfactual (`src/xai/`)
-6. RAG + LLM — 벡터 검색 후 Joule용 응답 조립 (`src/rag/`)
 
 ## 디렉터리
 
@@ -30,7 +29,7 @@
 3. `master_daily` 빌드함.
 4. 예측 모델(XGBoost, TFT 등) 실행함.
 5. XAI·노트북은 예측·피처가 준비된 뒤 선택 실행함.
-6. 강화학습·RAG는 현재 스켈레톤이라 실행 순서 없음(구현 후 이 README 갱신 예정임).
+6. 조달 시나리오 엔진은 DB·TFT 예측 입력이 있으면 바로 실행 가능함.
 
 ### 데이터 수집(`src/ingestion/`)
 
@@ -54,13 +53,9 @@
 
 - TreeSHAP 등: `python src/xai/shap_explainer.py` — DB와 저장된 XGBoost 모델을 전제로 함. XGB 파이프라인 이후 실행하는 편이 자연스러함.
 
-### 강화학습(`src/models/dqn_agent.py`, `ppo_agent.py`)
+### 조달 시나리오(`src/rl/scenario_engine.py`)
 
-- 함수 스켈레톤만 있고 학습 엔트리포인트는 없음. 순서 문서화는 구현 이후로 미룸.
-
-### RAG·Joule(`src/rag/`)
-
-- 동일하게 스켈레톤 상태임.
+- TFT 분위수 예측과 `master_daily` 맥락을 받아 Buy/Split/Wait 권고 JSON을 생성함. 테스트: `PYTHONPATH=src python3 tests/test_scenarios.py`.
 
 ### raw + `master_daily`만 빠르게
 
@@ -99,9 +94,6 @@
 - `master_daily`에서는 관측일만 쓸지·보간 행을 제외할지 정책으로 통제함.
 - forward-fill은 과거→현재만 사용함.
 
-## 상태
-
-현재 저장소는 스켈레톤(역할 주석·import 힌트·빈 함수)만 포함하며, 비즈니스 로직은 이후 스프린트에서 구현 예정임.
 
 ## 로컬 설정 (예정)
 

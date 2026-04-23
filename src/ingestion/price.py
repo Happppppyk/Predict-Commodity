@@ -12,7 +12,7 @@ import yfinance as yf
 
 logger = logging.getLogger("src.ingestion.price")
 
-# .cursorrules 기본 DB
+# 기본 DB 경로
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "db" / "soybean.db"
 DEFAULT_START_DATE = "2010-01-01"
 
