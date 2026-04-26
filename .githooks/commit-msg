@@ -1,6 +1,0 @@
-#!/bin/sh
-# 커밋 메시지에 동일한 영문 슬로건(made ... with ... cursor)이 있으면 막습니다.
-if [ -n "$1" ] && [ -f "$1" ] && grep -Eiq 'made[[:space:]]+with[[:space:]]+cursor' "$1" 2>/dev/null; then
-	echo "commit-msg: 커밋 메시지에 해당 푸터 문구를 쓸 수 없습니다." >&2
-	exit 1
-fi

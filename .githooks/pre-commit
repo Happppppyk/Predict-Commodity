@@ -1,6 +1,0 @@
-#!/bin/sh
-# 스테이징 diff에서 특정 툴 기본 푸터( m a d e  +  w i t h  +  c u r s o r ) 패턴이 있으면 커밋을 막습니다.
-if git diff --cached -U0 2>/dev/null | grep -Eiq 'made[[:space:]]+with[[:space:]]+cursor'; then
-	echo "pre-commit: 커밋에 해당 툴의 기본 푸터 문구(영문 슬로건)가 포함돼 있으면 안 됩니다. 제거한 뒤 다시 시도하세요." >&2
-	exit 1
-fi

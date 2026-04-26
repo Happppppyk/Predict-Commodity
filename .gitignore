@@ -14,3 +14,4 @@ venv/
 
 # 로컬용 (원격에 올리지 않음)
 scripts/push_both_remotes.sh
+.githooks/
