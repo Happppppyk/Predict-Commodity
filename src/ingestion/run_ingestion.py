@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,6 +32,35 @@ except ImportError:
 DB_PATH = _ROOT / "data" / "db" / "soybean.db"
 ENV_NEWS_KEY = "NEWS_INGESTION_API_KEY"
 
+NEWS_PIPELINE_SCRIPT = (
+    _ROOT / "src" / "ingestion" / "news" / "scripts" / "run_news_pipeline.py"
+)
+
+
+def _run_news_pipeline_v2() -> bool:
+    """News v2 파이프라인을 subprocess로 실행. 환경변수 비어 있으면 skip.
+
+    Returns:
+        True : pipeline 정상 종료 (returncode == 0)
+        False: 환경변수 미설정으로 스킵, 또는 returncode != 0
+    """
+    if not os.environ.get(ENV_NEWS_KEY, "").strip():
+        print(f"    스킵: {ENV_NEWS_KEY} 미설정")
+        return False
+
+    rel = NEWS_PIPELINE_SCRIPT.relative_to(_ROOT)
+    print(f"    {rel} 실행 (auto range)")
+    result = subprocess.run(
+        [sys.executable, str(NEWS_PIPELINE_SCRIPT)],
+        cwd=_ROOT,
+        env={**os.environ},
+    )
+    if result.returncode != 0:
+        print(f"    뉴스 파이프라인 실패 rc={result.returncode} — 다른 단계는 계속")
+        return False
+    return True
+
+
 # 요약 출력 순서 (존재하지 않는 테이블은 COUNT 시 건너뜀)
 SUMMARY_TABLES: list[str] = [
     "raw_price_futures",
@@ -48,7 +78,7 @@ SUMMARY_TABLES: list[str] = [
     "raw_vix",
     "raw_cftc",
     "raw_wasde",
-    "raw_news_scored",
+    "raw_news_scored_v2",
     "raw_sap_inventory",
     "raw_sap_po_history",
     "raw_sap_production",
@@ -58,7 +88,7 @@ SUMMARY_TABLES: list[str] = [
 def _zero_row_note(table: str, news_skipped: bool) -> str:
     if table == "raw_wasde":
         return " (수동 적재 필요)"
-    if table == "raw_news_scored":
+    if table == "raw_news_scored_v2":
         return " (API 키 필요)" if news_skipped else " (GDELT 응답 없음·레이트리밋 등)"
     if table.startswith("raw_sap_"):
         return " (엑셀 파일 필요)"
@@ -122,7 +152,6 @@ def main() -> None:
     )
     from src.ingestion.cftc import load_cftc
     from src.ingestion.wasde import RAW_WASDE_TABLE, load_wasde_from_csv, load_wasde_from_usda_api
-    from src.ingestion.news_scorer import load_news_to_db, run_news_pipeline
     from src.ingestion.sap_internal import (
         load_inventory,
         load_po_history,
@@ -180,8 +209,6 @@ def main() -> None:
         print("    FRED VIXCLS (일별) …")
         load_vix(conn)
 
-    news_skipped = not (os.environ.get(ENV_NEWS_KEY, "").strip())
-
     with sqlite3.connect(db_path) as conn:
         print("[3/6] CFTC …")
         load_cftc(conn)
@@ -197,18 +224,17 @@ def main() -> None:
             print("    WASDE CSV 없음 — USDA API 경로 사용")
             load_wasde_from_usda_api(conn)
 
-        print("[5/6] 뉴스(GDELT, 최근 7일) …")
-        if news_skipped:
-            load_news_to_db([], conn)
-            print(f"    스킵: {ENV_NEWS_KEY} 미설정")
-        else:
-            run_news_pipeline(conn, days_back=7)
+    # main DB conn 닫고 news 파이프라인 호출 (별도 news_v2.db + soybean.db export 시 lock 회피)
+    print("[5/6] 뉴스(GDELT GKG → SAP AI Core scoring v2) …")
+    _run_news_pipeline_v2()
 
+    with sqlite3.connect(db_path) as conn:
         print("[6/6] SAP 엑셀 (data/raw/ 있으면 적재) …")
         load_inventory(None, conn)
         load_po_history(None, conn)
         load_production_plan(None, conn)
 
+    news_skipped = not (os.environ.get(ENV_NEWS_KEY, "").strip())
     print_summary(db_path, news_skipped=news_skipped)
 
 

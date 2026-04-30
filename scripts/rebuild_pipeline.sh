@@ -15,7 +15,9 @@ import sqlite3
 conn = sqlite3.connect('data/db/soybean.db')
 tables = [
     'raw_canola_oil', 'raw_dollar_index',
-    'raw_sunflower_oil', 'raw_eia_biodiesel', 'master_daily'
+    'raw_sunflower_oil', 'raw_eia_biodiesel',
+    'raw_news_scored_v2',
+    'master_daily'
 ]
 print('=== 테이블별 행 수 ===')
 for t in tables:

@@ -16,3 +16,11 @@ venv/
 scripts/push_both_remotes.sh
 scripts/install_git_hooks.sh
 .githooks/
+.claude/
+
+# news pipeline runtime artifacts (재생성 가능)
+data/db/news_v2.db
+data/db/news_v2.db-shm
+data/db/news_v2.db-wal
+data/news/
+logs/news/
