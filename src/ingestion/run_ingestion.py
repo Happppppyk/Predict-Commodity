@@ -5,6 +5,9 @@
 
     python src/ingestion/run_ingestion.py
 
+# KPO=F는 Yahoo Finance 미지원(또는 불안정)으로 `price.py` FUTURES_SPECS에서 제거됨.
+# 팜유는 Investing.com CPOc1 CSV로 수동 적재: data/raw/palm_oil_cpo.csv → raw_palm_oil
+
 뉴스(GDELT): 환경변수 `NEWS_INGESTION_API_KEY` 가 비어 있으면 뉴스 단계는 스킵한다.
 (공개 API만 사용하더라도, 파이프라인에서 의도적으로 켤 때 아무 값이나 설정 — 예: `export NEWS_INGESTION_API_KEY=1`)
 """
@@ -77,7 +80,7 @@ def _zero_row_note(table: str, news_skipped: bool) -> str:
     if table == "raw_vix":
         return " (FRED CSV 응답/파싱 확인 필요)"
     if table == "raw_palm_oil":
-        return " (데이터 없음)"
+        return " (palm_oil_cpo.csv 수동 적재 필요)"
     return ""
 
 
@@ -138,7 +141,7 @@ def main() -> None:
         conn.commit()
     print(f"    DELETE FROM {RAW_CANOLA_OIL_TABLE} 완료 → 파이프라인 중 CSV로 재적재·행 수 출력")
 
-    print("[1/6] 선물 가격 (ZL, CL, ZS, ZM, 팜유 시도) …")
+    print("[1/6] 선물 가격 (ZL, CL, ZS, ZM; 팜유는 KPO=F 미사용, CSV 단계로만 적재) …")
     ingest_all_futures_to_sqlite(db_path, print_counts=False)
 
     palm_csv = PALM_OIL_CSV_DEFAULT_PATH

@@ -1,0 +1,37 @@
+{
+  "final_model": "v4_return",
+  "checkpoint": "models/tft_v4_return.ckpt",
+  "bias_path": "models/tft_v4_bias.json",
+  "conformal_method": "rolling (window=60)",
+  "v3_metrics": {
+    "coverage_fixed": 92.55,
+    "coverage_rolling": 65.22,
+    "interval_fixed": 185.88,
+    "interval_rolling": 133.37,
+    "bias": 143.74,
+    "mae_p50_corr": 89.94
+  },
+  "v4_metrics": {
+    "coverage_fixed": 52.26,
+    "coverage_rolling": 73.55,
+    "interval_fixed": 71.43,
+    "interval_rolling": 64.35,
+    "bias": -21.46,
+    "mae_p50_corr": 56.97
+  },
+  "decision_reason": "수익률 기반 학습으로 편향 절대값이 개선되어 v4를 최종 모델로 선택",
+  "limitations": [
+    "r_fwd_7d 자기참조 비중이 높아 일부 구간에서 과민 반응 가능",
+    "학습 범위 밖 급등/급락 국면은 완전 포착이 어려움",
+    "Conformal은 분포 이동이 클 때 커버리지 저하 가능"
+  ],
+  "usage": "방향성 참고 + 리스크 범위 제공",
+  "next_step": "시나리오 엔진 자동 연동",
+  "v5_metrics": {
+    "coverage_rolling": 85.16,
+    "interval_rolling": 57.26,
+    "bias": -11.12,
+    "mae_p50_corr": 40.25
+  },
+  "updated_at": "2026-04-27 17:03:38"
+}

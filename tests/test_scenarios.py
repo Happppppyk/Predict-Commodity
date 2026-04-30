@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from rl.scenario_engine import (  # noqa: E402
+    CBOT_TO_USD_PER_TON,
     TFTQuantileForecast,
     ScenarioRequest,
     evaluate_procurement_scenario,
@@ -28,6 +29,7 @@ def _assert_human_readable(result: dict) -> None:
     for k in (
         "current_price_summary",
         "forecast_summary",
+        "forecast_unit",
         "price_direction",
         "recommendation",
         "reason",
@@ -55,6 +57,7 @@ def run_all() -> None:
             safety_stock_ton=3500.0,
             quantity_ton=3000.0,
             monthly_consumption_ton=1200.0,
+            forecast_unit="cbot",
         ),
         TFTQuantileForecast(p10=68.0, p50=72.0, p90=78.0),
         db_path=DB_PATH,
@@ -76,6 +79,7 @@ def run_all() -> None:
             safety_stock_ton=3500.0,
             quantity_ton=3000.0,
             monthly_consumption_ton=1200.0,
+            forecast_unit="cbot",
         ),
         TFTQuantileForecast(p10=60.0, p50=64.0, p90=68.0),
         db_path=DB_PATH,
@@ -95,6 +99,7 @@ def run_all() -> None:
             safety_stock_ton=3500.0,
             quantity_ton=2000.0,
             monthly_consumption_ton=1200.0,
+            forecast_unit="cbot",
         ),
         TFTQuantileForecast(p10=58.0, p50=63.0, p90=68.0),
         db_path=DB_PATH,
@@ -108,6 +113,41 @@ def run_all() -> None:
     assert wait_viol and "납기 시점" in wait_viol[0]["reason"]
     lid3 = save_recommendation(r3, db_path=DB_PATH)
     saved_ids.append(lid3)
+
+    # 시나리오 4 — 단위 변환 일관성(CBOT vs USD/톤 직접입력)
+    req_cbot = ScenarioRequest(
+        current_inventory_ton=4000.0,
+        open_po_ton=0.0,
+        safety_stock_ton=3500.0,
+        quantity_ton=3000.0,
+        monthly_consumption_ton=1200.0,
+        forecast_unit="cbot",
+    )
+    req_usd = ScenarioRequest(
+        current_inventory_ton=4000.0,
+        open_po_ton=0.0,
+        safety_stock_ton=3500.0,
+        quantity_ton=3000.0,
+        monthly_consumption_ton=1200.0,
+        forecast_unit="usd_per_ton",
+    )
+    p10_cbot, p50_cbot, p90_cbot = 68.0, 72.0, 78.0
+    fc_cbot = TFTQuantileForecast(p10=p10_cbot, p50=p50_cbot, p90=p90_cbot)
+    fc_usd = TFTQuantileForecast(
+        p10=p10_cbot * CBOT_TO_USD_PER_TON,
+        p50=p50_cbot * CBOT_TO_USD_PER_TON,
+        p90=p90_cbot * CBOT_TO_USD_PER_TON,
+    )
+    r4_cbot = evaluate_procurement_scenario(req_cbot, fc_cbot, db_path=DB_PATH)
+    r4_usd = evaluate_procurement_scenario(req_usd, fc_usd, db_path=DB_PATH)
+    _assert_human_readable(r4_cbot)
+    _assert_human_readable(r4_usd)
+    assert r4_cbot["human_readable"]["forecast_unit"] == "CBOT → USD/톤 변환"
+    assert r4_usd["human_readable"]["forecast_unit"] == "TFT USD/톤 직접 입력"
+    assert abs(r4_cbot["forecast"]["p50"] - (72.0 * CBOT_TO_USD_PER_TON)) < 1e-9
+    assert abs(r4_usd["forecast"]["p50"] - 72.0 * CBOT_TO_USD_PER_TON) < 1e-9
+    assert abs(r4_cbot["forecast"]["p50"] - r4_usd["forecast"]["p50"]) < 1e-9
+    assert r4_cbot["recommended_action"] == r4_usd["recommended_action"]
 
     with sqlite3.connect(str(DB_PATH)) as conn:
         rows = conn.execute(

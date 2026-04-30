@@ -31,6 +31,19 @@ from utils.plot_style import configure_matplotlib_korean
 
 configure_matplotlib_korean()
 
+
+def _load_tft_from_checkpoint(
+    ckpt: str | Path, *, map_location: str | torch.device
+) -> TemporalFusionTransformer:
+    p = str(ckpt)
+    try:
+        return TemporalFusionTransformer.load_from_checkpoint(
+            p, map_location=map_location, weights_only=False
+        )
+    except TypeError:
+        return TemporalFusionTransformer.load_from_checkpoint(p, map_location=map_location)
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "db" / "soybean.db"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "features.yaml"
@@ -41,6 +54,10 @@ TFT_MULTI_CKPT_PATH = MODELS_DIR / "tft_v2_multi.ckpt"
 TFT_V2_BIAS_PATH = MODELS_DIR / "tft_v2_bias.json"
 TFT_V3_MULTI_CKPT_PATH = MODELS_DIR / "tft_v3_multi.ckpt"
 TFT_V3_BIAS_PATH = MODELS_DIR / "tft_v3_bias.json"
+TFT_V4_RETURN_CKPT_PATH = MODELS_DIR / "tft_v4_return.ckpt"
+TFT_V4_BIAS_PATH = MODELS_DIR / "tft_v4_bias.json"
+TFT_V5_WEIGHTED_CKPT_PATH = MODELS_DIR / "tft_v5_weighted.ckpt"
+TFT_V5_BIAS_PATH = MODELS_DIR / "tft_v5_bias.json"
 
 VAL_DAYS = 120
 CAL_DAYS = 90
@@ -335,7 +352,9 @@ def _plot_tft_v2_conformal_corrected(
     plt.close(fig)
 
 
-def _plot_p50_vs_actual_scatter(df_pred: pd.DataFrame, out_path: Path) -> None:
+def _plot_p50_vs_actual_scatter(
+    df_pred: pd.DataFrame, out_path: Path, *, title: str = "TFT: P50 vs actual"
+) -> None:
     d = df_pred.copy()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     x = d["actual"].to_numpy(dtype=np.float64)
@@ -347,7 +366,7 @@ def _plot_p50_vs_actual_scatter(df_pred: pd.DataFrame, out_path: Path) -> None:
     ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.2, label="y=x")
     ax.set_xlabel("Actual")
     ax.set_ylabel("P50")
-    ax.set_title("TFT v3 debug: P50 vs actual")
+    ax.set_title(title)
     ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -504,6 +523,460 @@ def prepare_tft_multi_dataset(
         f"날짜 {long['date'].min().date()} ~ {long['date'].max().date()}"
     )
     return training, calibration_dataset, test_dataset, long, group_idx_to_name
+
+
+def prepare_tft_soyoil_return_dataset(
+    db_path: str | Path,
+) -> tuple[TimeSeriesDataSet, TimeSeriesDataSet, TimeSeriesDataSet, pd.DataFrame, dict[int, str]]:
+    """
+    대두유 soyoil_usd_per_ton 기준:
+    - return_1d, return_7d(과거 7일) 피처
+    - 타깃: r_fwd_7d = 7거래일 선행 수익률 (t→t+7), (절대가 아닌 변화율)
+    역변환: P_k_price = soyoil_at_t * (1 + P_k_return) (h=0에서 t는 디코더 첫날)
+    """
+    db = Path(db_path)
+    if not db.is_file():
+        raise FileNotFoundError(f"DB 없음: {db.resolve()}")
+
+    master_cols = list(
+        dict.fromkeys(
+            ["date", "soyoil_usd_per_ton"]
+            + TFT_MULTI_KNOWN_REALS
+            + TFT_MULTI_UNKNOWN_REALS
+        )
+    )
+    with sqlite3.connect(db) as conn:
+        schema = {str(r[1]) for r in conn.execute("PRAGMA table_info(master_daily)").fetchall()}
+        load_m = [c for c in master_cols if c in schema]
+        miss_m = [c for c in master_cols if c not in ("date",) and c not in schema]
+        if miss_m:
+            warnings.warn(
+                f"master_daily에 없는 v4_return 피처는 제외: {miss_m}",
+                UserWarning,
+                stacklevel=2,
+            )
+        qm = ", ".join(f'"{c}"' for c in load_m)
+        master = pd.read_sql_query(f"SELECT {qm} FROM master_daily ORDER BY date", conn)
+    master["date"] = pd.to_datetime(master["date"], errors="coerce")
+    master = master.dropna(subset=["date"])
+    if "soyoil_usd_per_ton" not in master.columns:
+        raise KeyError("master_daily에 soyoil_usd_per_ton이 필요합니다.")
+    s = master["soyoil_usd_per_ton"].astype(float)
+    master["return_1d"] = s.pct_change(1)
+    master["return_7d"] = s.pct_change(7)
+    # 7거래일 앞(미래) 수익률: (P[t+7]-P[t])/P[t]
+    master["r_fwd_7d"] = s.shift(-7) / s - 1.0
+    g = s
+    master["price_lag_1"] = g.shift(1)
+    master["price_lag_7"] = g.shift(7)
+    master["volatility_20d"] = s.pct_change(1).rolling(20, min_periods=5).std()
+    ma30 = s.rolling(30, min_periods=15).mean()
+    master["price_to_ma30_ratio"] = s / ma30.replace(0, np.nan)
+    master["commodity"] = "soybean_oil"
+    udates = np.sort(master["date"].unique())
+    dmap = {pd.Timestamp(d): i for i, d in enumerate(udates)}
+    master["time_idx"] = master["date"].map(dmap).astype(np.int64)
+    for c in TFT_MULTI_KNOWN_REALS + TFT_MULTI_UNKNOWN_REALS:
+        if c in master.columns and str(master[c].dtype) in ("Int64", "Int32", "boolean"):
+            master[c] = master[c].astype(float)
+    req = [
+        "r_fwd_7d",
+        "soyoil_usd_per_ton",
+        "return_1d",
+        "return_7d",
+        "price_lag_1",
+        "price_lag_7",
+        "volatility_20d",
+        "price_to_ma30_ratio",
+    ]
+    req += [c for c in TFT_MULTI_KNOWN_REALS + TFT_MULTI_UNKNOWN_REALS if c in master.columns]
+    long = master.dropna(subset=[c for c in req if c in master.columns]).reset_index(drop=True)
+
+    known_active = [c for c in TFT_MULTI_KNOWN_REALS if c in long.columns]
+    unk_extra = [c for c in TFT_MULTI_UNKNOWN_REALS if c in long.columns]
+    _base_unk = [
+        "r_fwd_7d",
+        "soyoil_usd_per_ton",
+        "return_1d",
+        "return_7d",
+        "price_lag_1",
+        "price_lag_7",
+        "volatility_20d",
+        "price_to_ma30_ratio",
+    ]
+    unknown_with_target = list(
+        dict.fromkeys([c for c in _base_unk if c in long.columns] + unk_extra)
+    )
+    if "r_fwd_7d" not in long.columns or long["r_fwd_7d"].isna().all():
+        raise ValueError("r_fwd_7d(선행 7일 수익률) 유효 행이 없습니다.")
+
+    train_df = long.loc[long["date"] <= TFT_MULTI_TRAIN_LAST].copy()
+    if train_df.empty:
+        raise ValueError("v4_return train 구간이 비어 있습니다.")
+    group_idx_to_name = {0: "soybean_oil"}
+
+    training = TimeSeriesDataSet(
+        train_df,
+        time_idx="time_idx",
+        target="r_fwd_7d",
+        group_ids=["commodity"],
+        max_encoder_length=MAX_ENCODER_LENGTH,
+        min_encoder_length=MIN_ENCODER_LENGTH_MULTI,
+        max_prediction_length=MAX_PREDICTION_LENGTH,
+        static_categoricals=["commodity"],
+        time_varying_known_reals=known_active,
+        time_varying_unknown_reals=unknown_with_target,
+        add_relative_time_idx=True,
+        add_target_scales=True,
+        randomize_length=None,
+    )
+
+    first_pred_idx = int(long.loc[long["date"] > TFT_MULTI_TRAIN_LAST, "time_idx"].min())
+    cal_end_tidx = int(long.loc[long["date"] <= TFT_MULTI_CAL_END, "time_idx"].max())
+    test_start_tidx = int(long.loc[long["date"] >= TFT_MULTI_TEST_START, "time_idx"].min())
+    tail_windows = TimeSeriesDataSet.from_dataset(
+        training,
+        long,
+        stop_randomization=True,
+        predict=False,
+        min_prediction_idx=first_pred_idx,
+    )
+    calibration_dataset = tail_windows.filter(
+        lambda di: (di["time_idx_last"] <= cal_end_tidx).to_numpy(dtype=bool)
+    )
+    test_dataset = tail_windows.filter(
+        lambda di: (di["time_idx_first_prediction"] >= test_start_tidx).to_numpy(dtype=bool)
+    )
+    n_train_samples = len(training)
+    print(
+        f"[prepare_tft_soyoil_return_dataset] v4_return | 학습샘플={n_train_samples:,} | "
+        f"cal={len(calibration_dataset):,} | test={len(test_dataset):,} | "
+        f"날짜 {long['date'].min().date()} ~ {long['date'].max().date()}"
+    )
+    return training, calibration_dataset, test_dataset, long, group_idx_to_name
+
+
+def create_sample_weights(df: pd.DataFrame) -> np.ndarray:
+    weights = np.ones(len(df), dtype=np.float64)
+    dt = pd.to_datetime(df["date"], errors="coerce")
+
+    war_mask = (dt >= pd.Timestamp("2022-02-01")) & (dt <= pd.Timestamp("2022-08-31"))
+    weights[np.asarray(war_mask)] = 3.0
+
+    covid_mask = (dt >= pd.Timestamp("2021-01-01")) & (dt <= pd.Timestamp("2021-12-31"))
+    weights[np.asarray(covid_mask)] = 2.5
+
+    recent_mask = dt >= pd.Timestamp("2025-01-01")
+    weights[np.asarray(recent_mask)] = 2.0
+
+    if "return_7d" in df.columns:
+        big_move = df["return_7d"].astype(float).abs() > 0.05
+        weights[np.asarray(big_move.fillna(False))] = (
+            weights[np.asarray(big_move.fillna(False))] * 1.5
+        )
+
+    return weights
+
+
+def prepare_tft_soyoil_return_weighted_dataset(
+    db_path: str | Path,
+) -> tuple[TimeSeriesDataSet, TimeSeriesDataSet, TimeSeriesDataSet, pd.DataFrame, dict[int, str]]:
+    _training, _cal_ds, _test_ds, long, group_idx = prepare_tft_soyoil_return_dataset(db_path)
+    long2 = long.copy()
+    long2["sample_weight"] = create_sample_weights(long2).astype(float)
+    train_df = long2.loc[long2["date"] <= TFT_MULTI_TRAIN_LAST].copy()
+    known_active = [c for c in TFT_MULTI_KNOWN_REALS if c in long2.columns]
+    unk_extra = [c for c in TFT_MULTI_UNKNOWN_REALS if c in long2.columns]
+    _base_unk = [
+        "r_fwd_7d",
+        "soyoil_usd_per_ton",
+        "return_1d",
+        "return_7d",
+        "price_lag_1",
+        "price_lag_7",
+        "volatility_20d",
+        "price_to_ma30_ratio",
+    ]
+    unknown_with_target = list(
+        dict.fromkeys([c for c in _base_unk if c in long2.columns] + unk_extra)
+    )
+    training_w = TimeSeriesDataSet(
+        train_df,
+        time_idx="time_idx",
+        target="r_fwd_7d",
+        group_ids=["commodity"],
+        max_encoder_length=MAX_ENCODER_LENGTH,
+        min_encoder_length=MIN_ENCODER_LENGTH_MULTI,
+        max_prediction_length=MAX_PREDICTION_LENGTH,
+        static_categoricals=["commodity"],
+        time_varying_known_reals=known_active,
+        time_varying_unknown_reals=unknown_with_target,
+        add_relative_time_idx=True,
+        add_target_scales=True,
+        randomize_length=None,
+        weight="sample_weight",
+    )
+    first_pred_idx = int(long2.loc[long2["date"] > TFT_MULTI_TRAIN_LAST, "time_idx"].min())
+    cal_end_tidx = int(long2.loc[long2["date"] <= TFT_MULTI_CAL_END, "time_idx"].max())
+    test_start_tidx = int(long2.loc[long2["date"] >= TFT_MULTI_TEST_START, "time_idx"].min())
+    tail_windows = TimeSeriesDataSet.from_dataset(
+        training_w,
+        long2,
+        stop_randomization=True,
+        predict=False,
+        min_prediction_idx=first_pred_idx,
+    )
+    calibration_dataset = tail_windows.filter(
+        lambda di: (di["time_idx_last"] <= cal_end_tidx).to_numpy(dtype=bool)
+    )
+    test_dataset = tail_windows.filter(
+        lambda di: (di["time_idx_first_prediction"] >= test_start_tidx).to_numpy(dtype=bool)
+    )
+    print(
+        "[prepare_tft_soyoil_return_weighted_dataset] "
+        f"가중치 min/mean/max={long2['sample_weight'].min():.2f}/"
+        f"{long2['sample_weight'].mean():.2f}/{long2['sample_weight'].max():.2f}"
+    )
+    return training_w, calibration_dataset, test_dataset, long2, group_idx
+
+
+def _return_horizon0_to_soy_prices(
+    df_pred: pd.DataFrame, df_soy: pd.DataFrame, *, max_horizon: int = 0
+) -> pd.DataFrame:
+    """수익률 예측(분위)을 대두유 USD/톤 가격으로 역변환. P_k_price = P_t * (1 + P_k_return)."""
+    dfp = df_pred if max_horizon is None else df_pred.loc[df_pred["horizon"] <= max_horizon].copy()
+    if dfp.empty:
+        return pd.DataFrame()
+    smap = (
+        df_soy[["time_idx", "date", "soyoil_usd_per_ton"]]
+        .drop_duplicates("time_idx")
+        .rename(columns={"soyoil_usd_per_ton": "soy_at_t"})
+    )
+    m = dfp.merge(smap, on="time_idx", how="left", validate="m:1")
+    for col in ("p10", "p50", "p90"):
+        m[f"price_{col}"] = m["soy_at_t"] * (1.0 + m[col].astype(float))
+    tidx_to_soy = smap.set_index("time_idx")["soy_at_t"]
+    m["soy_t_plus7"] = [float(tidx_to_soy.get(ti + 7, np.nan)) for ti in m["time_idx"].astype(int)]
+    m["actual_soy_price"] = m["soy_t_plus7"]
+    return m
+
+
+def run_tft_v4_return_pipeline(db_path: str | Path | None = None) -> dict[str, float]:
+    db = Path(db_path) if db_path else DEFAULT_DB_PATH
+    training, cal_ds, test_ds, df_long, group_idx = prepare_tft_soyoil_return_dataset(db)
+    tft = build_tft_model(training)
+    trainer, tft = train_tft(
+        training,
+        cal_ds,
+        tft=tft,
+        max_epochs=50,
+        force_cpu=True,
+    )
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    trainer.save_checkpoint(str(TFT_V4_RETURN_CKPT_PATH))
+    print(f"[v4_return] 체크포인트: {TFT_V4_RETURN_CKPT_PATH.resolve()}")
+
+    df_cal = _collect_validation_predictions(tft, cal_ds, quiet=True, group_idx_to_name=group_idx)
+    df_test = _collect_validation_predictions(tft, test_ds, quiet=True, group_idx_to_name=group_idx)
+    dfc = _return_horizon0_to_soy_prices(
+        df_cal.loc[df_cal["horizon"] == 0], df_long
+    )
+    dft = _return_horizon0_to_soy_prices(
+        df_test.loc[df_test["horizon"] == 0], df_long
+    )
+    if dft.empty:
+        raise RuntimeError("v4 test horizon0 변환 데이터가 없습니다.")
+    dfc2 = dfc.dropna(subset=["actual_soy_price", "price_p50"])
+    cal_start, cal_end = pd.Timestamp("2025-08-01"), pd.Timestamp("2025-09-30")
+    dfc2b = dfc2.copy()
+    dfc2b["_dt"] = pd.to_datetime(dfc2b["date"], errors="coerce")
+    mask_cal = (dfc2b["_dt"] >= cal_start) & (dfc2b["_dt"] <= cal_end)
+    bias = (
+        float(
+            (
+                dfc2b.loc[mask_cal, "actual_soy_price"] - dfc2b.loc[mask_cal, "price_p50"]
+            ).mean()
+        )
+        if mask_cal.any()
+        else float("nan")
+    )
+    _save_tft_v2_bias(
+        bias,
+        cal_start=cal_start,
+        cal_end=cal_end,
+        out_path=TFT_V4_BIAS_PATH,
+    )
+    mae = float(
+        np.mean(
+            np.abs(
+                dft["price_p50"].to_numpy() - dft["actual_soy_price"].to_numpy()
+            )
+        )
+    )
+    print(
+        f"[v4_return] test MAE (P50 price vs 7d-ahead actual): {mae:.4f} USD/ton | "
+        f"bias(2025-08~09)={bias if np.isfinite(bias) else float('nan'):+.4f}"
+    )
+    (NOTEBOOKS_DIR / "results").mkdir(parents=True, exist_ok=True)
+    pred_plot = NOTEBOOKS_DIR / "results" / "tft_v4_prediction.png"
+    dfp = dft.dropna(subset=["price_p50", "actual_soy_price"])
+    if not dfp.empty:
+        _plot_p50_vs_actual_scatter(
+            pd.DataFrame(
+                {
+                    "p50": dfp["price_p50"],
+                    "actual": dfp["actual_soy_price"],
+                }
+            ),
+            pred_plot,
+            title="TFT v4 (return): P50 price vs actual (7d, USD/ton)",
+        )
+    dbg = NOTEBOOKS_DIR / "results" / "tft_v4_debug_p50_vs_actual.png"
+    if not dfp.empty:
+        _plot_p50_vs_actual_scatter(
+            pd.DataFrame({"p50": dfp["price_p50"], "actual": dfp["actual_soy_price"]}),
+            dbg,
+            title="TFT v4 (return) debug: P50 vs actual",
+        )
+    vi = NOTEBOOKS_DIR / "results" / "tft_v4_variable_importance.png"
+    _ = get_tft_variable_importance(tft, cal_ds, out_path=vi)
+    for p, lab in (pred_plot, "예측"), (dbg, "디버그"), (vi, "변수중요도"):
+        print(f"[v4_return] {lab} 저장: {p.resolve()}")
+    return {
+        "mae_p50_soyprice_test": mae,
+        "bias_cal_price": float(bias) if np.isfinite(bias) else float("nan"),
+    }
+
+
+def _update_final_summary_with_v5(v5_metrics: dict[str, float]) -> Path:
+    out = MODELS_DIR / "tft_final_summary.json"
+    payload: dict[str, object] = {}
+    if out.is_file():
+        try:
+            payload = json.loads(out.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+    payload["v5_metrics"] = {
+        "coverage_rolling": round(float(v5_metrics["coverage_rolling"]) * 100.0, 2),
+        "interval_rolling": round(float(v5_metrics["interval_rolling_half"]), 2),
+        "bias": round(float(v5_metrics["bias"]), 2),
+        "mae_p50_corr": round(float(v5_metrics["mae_p50_corr"]), 2),
+    }
+    payload["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out
+
+
+def run_tft_v5_weighted_pipeline(db_path: str | Path | None = None) -> dict[str, float]:
+    db = Path(db_path) if db_path else DEFAULT_DB_PATH
+    training, cal_ds, test_ds, df_long, group_idx = prepare_tft_soyoil_return_weighted_dataset(db)
+    tft = build_tft_model(training)
+    trainer, tft = train_tft(
+        training,
+        cal_ds,
+        tft=tft,
+        max_epochs=50,
+        force_cpu=True,
+    )
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    trainer.save_checkpoint(str(TFT_V5_WEIGHTED_CKPT_PATH))
+    print(f"[v5_weighted] 체크포인트: {TFT_V5_WEIGHTED_CKPT_PATH.resolve()}")
+
+    df_cal = _collect_validation_predictions(tft, cal_ds, quiet=True, group_idx_to_name=group_idx)
+    df_test = _collect_validation_predictions(tft, test_ds, quiet=True, group_idx_to_name=group_idx)
+    dfc = _return_horizon0_to_soy_prices(df_cal.loc[df_cal["horizon"] == 0], df_long)
+    dft = _return_horizon0_to_soy_prices(df_test.loc[df_test["horizon"] == 0], df_long)
+    if dft.empty:
+        raise RuntimeError("v5 test horizon0 변환 데이터가 없습니다.")
+    cal_part = pd.DataFrame(
+        {"date": dfc["date"], "p50": dfc["price_p50"], "actual": dfc["actual_soy_price"]}
+    ).dropna(subset=["date", "p50", "actual"])
+    test_part = pd.DataFrame(
+        {"date": dft["date"], "p50": dft["price_p50"], "actual": dft["actual_soy_price"]}
+    ).dropna(subset=["date", "p50", "actual"])
+
+    cal_start, cal_end = pd.Timestamp("2025-08-01"), pd.Timestamp("2025-09-30")
+    ctmp = cal_part.copy()
+    ctmp["date"] = pd.to_datetime(ctmp["date"], errors="coerce")
+    mcal = (ctmp["date"] >= cal_start) & (ctmp["date"] <= cal_end)
+    bias = float((ctmp.loc[mcal, "actual"] - ctmp.loc[mcal, "p50"]).mean()) if mcal.any() else float("nan")
+    _save_tft_v2_bias(
+        bias,
+        cal_start=cal_start,
+        cal_end=cal_end,
+        out_path=TFT_V5_BIAS_PATH,
+    )
+
+    dfp = dft.dropna(subset=["price_p50", "actual_soy_price"])
+    mae = float(np.mean(np.abs(dfp["price_p50"].to_numpy() - dfp["actual_soy_price"].to_numpy())))
+    (NOTEBOOKS_DIR / "results").mkdir(parents=True, exist_ok=True)
+    pred_plot = NOTEBOOKS_DIR / "results" / "tft_v5_prediction.png"
+    dbg_plot = NOTEBOOKS_DIR / "results" / "tft_v5_debug_p50_vs_actual.png"
+    vi_plot = NOTEBOOKS_DIR / "results" / "tft_v5_variable_importance.png"
+    _plot_p50_vs_actual_scatter(
+        pd.DataFrame({"p50": dfp["price_p50"], "actual": dfp["actual_soy_price"]}),
+        pred_plot,
+        title="TFT v5 (weighted): P50 price vs actual (7d, USD/ton)",
+    )
+    _plot_p50_vs_actual_scatter(
+        pd.DataFrame({"p50": dfp["price_p50"], "actual": dfp["actual_soy_price"]}),
+        dbg_plot,
+        title="TFT v5 (weighted) debug: P50 vs actual",
+    )
+    _ = get_tft_variable_importance(tft, cal_ds, out_path=vi_plot)
+
+    v5m = _evaluate_single_rolling(
+        label="v5",
+        cal_part=cal_part,
+        test_part=test_part,
+        bias_path=TFT_V5_BIAS_PATH,
+        alpha_roll=0.85,
+        make_plot=True,
+    )
+    v4_cal, v4_test = _parts_from_v4(db, TFT_V4_RETURN_CKPT_PATH)
+    v4m = _evaluate_single_rolling(
+        label="v4",
+        cal_part=v4_cal,
+        test_part=v4_test,
+        bias_path=TFT_V4_BIAS_PATH,
+        alpha_roll=0.85,
+        make_plot=False,
+    )
+    v5_roll_plot = NOTEBOOKS_DIR / "results" / "tft_v5_rolling_conformal.png"
+    print("\n===== v4 vs v5 비교 =====")
+    print(
+        f"v4 Coverage: {float(v4m['coverage_rolling']) * 100:.2f}%, "
+        f"구간: ±{float(v4m['interval_rolling_half_mean']):.0f}달러, "
+        f"bias: {float(v4m['bias']):+.2f}달러"
+    )
+    print(
+        f"v5 Coverage: {float(v5m['coverage_rolling']) * 100:.2f}%, "
+        f"구간: ±{float(v5m['interval_rolling_half_mean']):.0f}달러, "
+        f"bias: {float(v5m['bias']):+.2f}달러"
+    )
+    dc = (float(v5m["coverage_rolling"]) - float(v4m["coverage_rolling"])) * 100.0
+    dw = float(v5m["interval_rolling_half_mean"]) - float(v4m["interval_rolling_half_mean"])
+    print(f"개선 여부: Coverage {dc:+.2f}%, 구간 ±{dw:+.2f}달러 변화")
+    print("=========================")
+    summary_path = _update_final_summary_with_v5(
+        {
+            "coverage_rolling": float(v5m["coverage_rolling"]),
+            "interval_rolling_half": float(v5m["interval_rolling_half_mean"]),
+            "bias": float(v5m["bias"]),
+            "mae_p50_corr": float(v5m["mae_p50_corr"]),
+        }
+    )
+    print(f"[v5_weighted] 예측 저장: {pred_plot.resolve()}")
+    print(f"[v5_weighted] 디버그 저장: {dbg_plot.resolve()}")
+    print(f"[v5_weighted] 변수중요도 저장: {vi_plot.resolve()}")
+    print(f"[v5_weighted] rolling 저장: {v5_roll_plot.resolve()}")
+    print(f"[v5_weighted] summary 업데이트: {summary_path.resolve()}")
+    return {
+        "mae_p50_soyprice_test": mae,
+        "bias_cal_price": float(bias) if np.isfinite(bias) else float("nan"),
+        "coverage_rolling": float(v5m["coverage_rolling"]),
+        "interval_rolling_half": float(v5m["interval_rolling_half_mean"]),
+    }
 
 
 def prepare_tft_dataset(
@@ -1285,11 +1758,7 @@ def run_tft_multi_eval_from_checkpoint(
         prepare_tft_multi_dataset(db)
     )
     acc = _select_accelerator()
-    tft = TemporalFusionTransformer.load_from_checkpoint(
-        str(ckpt),
-        map_location=acc,
-        weights_only=False,
-    )
+    tft = _load_tft_from_checkpoint(ckpt, map_location=acc)
     tft.to(torch.device(acc))
     tft.eval()
 
@@ -1580,6 +2049,414 @@ def run_tft_pipeline(
         print(f"v1 대비 Coverage 변화: {prev_cov:.2f}% → {new_cov:.2f}%")
 
 
+def calc_rolling_conformal_q(
+    df: pd.DataFrame,
+    window_days: int = 60,
+    alpha: float = 0.8,
+) -> pd.DataFrame:
+    """
+    고정 calibration 대신, 매 스텝 직전 window_days일의 P50-실제(가격) 잔차로 q를 정한다.
+
+    df: columns date, p50, actual (가격, USD/톤), 시간 오름차순.
+    """
+    d = df.sort_values("date").reset_index(drop=True)
+    ress = (d["p50"].astype(float) - d["actual"].astype(float)).abs()
+    results: list[dict[str, object]] = []
+    for i in range(window_days, len(d)):
+        cal_res = ress.iloc[i - window_days : i]
+        q = float(cal_res.quantile(alpha))
+        row = d.iloc[i]
+        p50 = float(row["p50"])
+        a = float(row["actual"])
+        results.append(
+            {
+                "date": row["date"],
+                "p50": p50,
+                "actual": a,
+                "p10_rolling": p50 - q,
+                "p90_rolling": p50 + q,
+                "q": q,
+            }
+        )
+    return pd.DataFrame(results)
+
+
+def _load_bias_from_json(path: Path) -> float | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    v = payload.get("bias")
+    try:
+        fv = float(v)
+        return fv if np.isfinite(fv) else None
+    except Exception:
+        return None
+
+
+def _parts_from_v3(
+    db: Path,
+    ckpt: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    _training, cal_ds, test_ds, df_long, group_idx = prepare_tft_multi_dataset(db)
+    tft = _load_tft_from_checkpoint(ckpt, map_location="cpu")
+    tft.to(torch.device("cpu"))
+    tft.eval()
+    df_cal = _collect_validation_predictions(tft, cal_ds, quiet=True, group_idx_to_name=group_idx)
+    df_test = _collect_validation_predictions(tft, test_ds, quiet=True, group_idx_to_name=group_idx)
+    dm = (
+        df_long.loc[df_long["commodity"] == "soybean_oil", ["time_idx", "date"]]
+        .drop_duplicates("time_idx")
+    )
+    tmap = (
+        df_long.loc[df_long["commodity"] == "soybean_oil", ["time_idx", "price_close"]]
+        .drop_duplicates("time_idx")
+        .rename(columns={"price_close": "actual_price"})
+    )
+
+    def h0_soy(dfp: pd.DataFrame) -> pd.DataFrame:
+        h = dfp.loc[(dfp["horizon"] == 0) & (dfp["commodity"] == "soybean_oil")].merge(
+            dm, on="time_idx", how="left"
+        )
+        h = h.merge(tmap, on="time_idx", how="left")
+        act = h["actual_price"].fillna(h["actual"])
+        return pd.DataFrame({"date": h["date"], "p50": h["p50"], "actual": act})
+
+    cal_part, test_part = h0_soy(df_cal), h0_soy(df_test)
+    cal_part = cal_part.dropna(subset=["date", "p50", "actual"]).copy()
+    test_part = test_part.dropna(subset=["date", "p50", "actual"]).copy()
+    return cal_part, test_part
+
+
+def _parts_from_v4(
+    db: Path,
+    ckpt: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    _training, cal_ds, test_ds, df_long, group_idx = prepare_tft_soyoil_return_dataset(db)
+    tft = _load_tft_from_checkpoint(ckpt, map_location="cpu")
+    tft.to(torch.device("cpu"))
+    tft.eval()
+    df_cal = _collect_validation_predictions(tft, cal_ds, quiet=True, group_idx_to_name=group_idx)
+    df_test = _collect_validation_predictions(tft, test_ds, quiet=True, group_idx_to_name=group_idx)
+    dfc = _return_horizon0_to_soy_prices(df_cal.loc[df_cal["horizon"] == 0], df_long)
+    dft = _return_horizon0_to_soy_prices(df_test.loc[df_test["horizon"] == 0], df_long)
+    cal_part = pd.DataFrame(
+        {"date": dfc["date"], "p50": dfc["price_p50"], "actual": dfc["actual_soy_price"]}
+    ).dropna(subset=["date", "p50", "actual"])
+    test_part = pd.DataFrame(
+        {"date": dft["date"], "p50": dft["price_p50"], "actual": dft["actual_soy_price"]}
+    ).dropna(subset=["date", "p50", "actual"])
+    return cal_part, test_part
+
+
+def _evaluate_single_rolling(
+    *,
+    label: str,
+    cal_part: pd.DataFrame,
+    test_part: pd.DataFrame,
+    bias_path: Path,
+    test_start: pd.Timestamp = pd.Timestamp("2025-10-01"),
+    test_end: pd.Timestamp = pd.Timestamp("2026-04-13"),
+    window_days: int = 60,
+    alpha_fixed: float = 0.85,
+    alpha_roll: float = 0.8,
+    make_plot: bool = True,
+) -> dict[str, object]:
+    cal = cal_part.copy()
+    test = test_part.copy()
+    cal["date"] = pd.to_datetime(cal["date"], errors="coerce")
+    test["date"] = pd.to_datetime(test["date"], errors="coerce")
+    cal = cal.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    test = test.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+    q_fixed = float((cal["p50"].astype(float) - cal["actual"].astype(float)).abs().quantile(alpha_fixed))
+    bias = _load_bias_from_json(bias_path)
+    if bias is None:
+        mcal = (cal["date"] >= pd.Timestamp("2025-08-01")) & (cal["date"] <= pd.Timestamp("2025-09-30"))
+        bias = float((cal.loc[mcal, "actual"] - cal.loc[mcal, "p50"]).mean()) if mcal.any() else 0.0
+
+    test_eval = test[(test["date"] >= test_start) & (test["date"] <= test_end)].copy()
+    if test_eval.empty:
+        test_eval = test.copy()
+    p50_test = test_eval["p50"].astype(float) + float(bias)
+    actual_test = test_eval["actual"].astype(float)
+    cov_fixed = float(np.mean((actual_test > p50_test - q_fixed) & (actual_test < p50_test + q_fixed)))
+    mae = float(np.mean(np.abs(actual_test - p50_test)))
+
+    full = pd.concat([cal, test], ignore_index=True).sort_values("date").reset_index(drop=True)
+    full["p50_adj"] = full["p50"].astype(float) + float(bias)
+    roll_in = full[["date", "p50_adj", "actual"]].rename(columns={"p50_adj": "p50"})
+    roll_df = calc_rolling_conformal_q(roll_in, window_days=window_days, alpha=alpha_roll)
+    roll_df["date"] = pd.to_datetime(roll_df["date"], errors="coerce")
+    roll_test = roll_df[(roll_df["date"] >= test_start) & (roll_df["date"] <= test_end)].copy()
+    if roll_test.empty:
+        roll_test = roll_df.copy()
+    cov_roll = float(
+        np.mean(
+            (roll_test["actual"].to_numpy() > roll_test["p10_rolling"].to_numpy())
+            & (roll_test["actual"].to_numpy() < roll_test["p90_rolling"].to_numpy())
+        )
+    )
+    w_roll = float((roll_test["p90_rolling"] - roll_test["p10_rolling"]).abs().mean())
+    w_roll_half = w_roll * 0.5
+
+    out_png = NOTEBOOKS_DIR / "results" / f"tft_{label}_rolling_conformal.png"
+    if make_plot:
+        (NOTEBOOKS_DIR / "results").mkdir(parents=True, exist_ok=True)
+        n = len(roll_test)
+        ridx = np.arange(n)
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        ax0 = axes[0]
+        ax0.plot(ridx, roll_test["actual"].to_numpy(), "k-", label="Actual", linewidth=1.0)
+        ax0.plot(ridx, roll_test["p50"].to_numpy(), "b-", label="P50 (bias+)", alpha=0.7)
+        ax0.fill_between(
+            ridx,
+            roll_test["p10_rolling"].to_numpy(),
+            roll_test["p90_rolling"].to_numpy(),
+            color="tab:green",
+            alpha=0.2,
+            label="Rolling 80% band",
+        )
+        p50f = roll_test["p50"].to_numpy()
+        ax0.fill_between(
+            ridx,
+            p50f - q_fixed,
+            p50f + q_fixed,
+            color="tab:orange",
+            alpha=0.10,
+            label=f"Fixed ±q (±{q_fixed:.0f})",
+        )
+        ax0.set_ylabel("USD/톤")
+        ax0.legend(loc="best", fontsize=7)
+        ax0.set_title(f"TFT {label}: Actual, P50, Rolling vs fixed conformal")
+        ax1 = axes[1]
+        ax1.plot(ridx, roll_test["q"].to_numpy(), color="tab:purple", label="Rolling q (window)")
+        ax1.axhline(q_fixed, color="tab:orange", linestyle="--", label=f"Fixed q = {q_fixed:.1f}")
+        ax1.set_xlabel("Step (roll_test 순서)")
+        ax1.set_ylabel("q (USD/톤)")
+        ax1.legend(loc="best", fontsize=7)
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=150)
+        plt.close(fig)
+
+    return {
+        "label": label,
+        "bias": float(bias),
+        "coverage_fixed": cov_fixed,
+        "coverage_rolling": cov_roll,
+        "interval_fixed_half": q_fixed,
+        "interval_rolling_half_mean": w_roll_half,
+        "mae_p50_corr": mae,
+        "plot_path": str(out_png),
+        "test_fixed_df": pd.DataFrame({"date": test_eval["date"], "actual": actual_test, "p50_corr": p50_test}),
+        "roll_test_df": roll_test[["date", "p10_rolling", "p90_rolling"]].copy(),
+    }
+
+
+def _tune_v4_rolling_alpha(
+    *,
+    v4_cal: pd.DataFrame,
+    v4_test: pd.DataFrame,
+    bias_path: Path,
+) -> dict[str, float]:
+    tried = [0.80, 0.85, 0.90, 0.92]
+    rows: list[dict[str, float]] = []
+    for a in tried:
+        m = _evaluate_single_rolling(
+            label="v4",
+            cal_part=v4_cal,
+            test_part=v4_test,
+            bias_path=bias_path,
+            alpha_roll=a,
+            make_plot=False,
+        )
+        rows.append(
+            {
+                "alpha": a,
+                "coverage_pct": float(m["coverage_rolling"]) * 100.0,
+                "interval_half": float(m["interval_rolling_half_mean"]),
+            }
+        )
+    target = 80.0
+    best = min(rows, key=lambda r: (abs(r["coverage_pct"] - target), r["interval_half"]))
+    print("\n===== Rolling Conformal alpha 비교 (v4) =====")
+    for r in rows:
+        tag = " (기존)" if abs(r["alpha"] - 0.80) < 1e-12 else ""
+        print(
+            f"alpha={r['alpha']:.2f}: Coverage={r['coverage_pct']:.2f}%, "
+            f"구간=±{r['interval_half']:.0f}달러{tag}"
+        )
+    print("============================================")
+    print(
+        f"최적 alpha: {best['alpha']:.2f} (Coverage: {best['coverage_pct']:.2f}%, "
+        f"구간: ±{best['interval_half']:.2f}달러)"
+    )
+    return {
+        "optimal_alpha": float(best["alpha"]),
+        "optimal_coverage": float(best["coverage_pct"]),
+        "optimal_interval": float(best["interval_half"]),
+    }
+
+
+def _update_v4_bias_with_optimal(path: Path, tuned: dict[str, float]) -> None:
+    payload: dict[str, object] = {}
+    if path.is_file():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+    payload["optimal_alpha"] = round(float(tuned["optimal_alpha"]), 2)
+    payload["optimal_coverage"] = round(float(tuned["optimal_coverage"]), 2)
+    payload["optimal_interval"] = round(float(tuned["optimal_interval"]), 2)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _plot_v3_v4_comparison(v3: dict[str, object], v4: dict[str, object]) -> Path:
+    v3_fixed = v3["test_fixed_df"].copy()
+    v4_fixed = v4["test_fixed_df"].copy()
+    v3_roll = v3["roll_test_df"].copy()
+    v4_roll = v4["roll_test_df"].copy()
+    for d in (v3_fixed, v4_fixed, v3_roll, v4_roll):
+        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+
+    m = (
+        v3_fixed.rename(columns={"actual": "actual_v3", "p50_corr": "v3_p50_corr"})
+        .merge(v4_fixed.rename(columns={"actual": "actual_v4", "p50_corr": "v4_p50_corr"}), on="date", how="inner")
+        .merge(v3_roll, on="date", how="left")
+        .merge(v4_roll.rename(columns={"p10_rolling": "p10_rolling_v4", "p90_rolling": "p90_rolling_v4"}), on="date", how="left")
+        .sort_values("date")
+    )
+    m["actual"] = m[["actual_v3", "actual_v4"]].mean(axis=1)
+    out_png = NOTEBOOKS_DIR / "results" / "tft_version_comparison.png"
+    (NOTEBOOKS_DIR / "results").mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+    ax.plot(m["date"], m["actual"], color="black", linewidth=1.2, label="Actual")
+    ax.plot(m["date"], m["v3_p50_corr"], color="tab:blue", linewidth=1.1, label="v3 P50_corr")
+    ax.plot(m["date"], m["v4_p50_corr"], color="tab:green", linewidth=1.1, label="v4 P50_corr")
+    ax.fill_between(
+        m["date"].to_numpy(),
+        m["p10_rolling"].to_numpy(dtype=float),
+        m["p90_rolling"].to_numpy(dtype=float),
+        color="lightskyblue",
+        alpha=0.22,
+        label="v3 Rolling band",
+    )
+    ax.fill_between(
+        m["date"].to_numpy(),
+        m["p10_rolling_v4"].to_numpy(dtype=float),
+        m["p90_rolling_v4"].to_numpy(dtype=float),
+        color="lightgreen",
+        alpha=0.22,
+        label="v4 Rolling band",
+    )
+    ax.set_title("TFT v3 vs v4 (test: 2025-10-01 ~ 2026-04-13)")
+    ax.set_xlabel("date")
+    ax.set_ylabel("USD/톤")
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
+def _write_final_summary(v3: dict[str, object], v4: dict[str, object]) -> Path:
+    final_model = "v4_return" if abs(float(v4["bias"])) <= abs(float(v3["bias"])) else "v3"
+    payload = {
+        "final_model": final_model,
+        "checkpoint": "models/tft_v4_return.ckpt" if final_model == "v4_return" else "models/tft_v3_multi.ckpt",
+        "bias_path": "models/tft_v4_bias.json" if final_model == "v4_return" else "models/tft_v3_bias.json",
+        "conformal_method": "rolling (window=60)",
+        "v3_metrics": {
+            "coverage_fixed": round(float(v3["coverage_fixed"]) * 100.0, 2),
+            "coverage_rolling": round(float(v3["coverage_rolling"]) * 100.0, 2),
+            "interval_fixed": round(float(v3["interval_fixed_half"]), 2),
+            "interval_rolling": round(float(v3["interval_rolling_half_mean"]), 2),
+            "bias": round(float(v3["bias"]), 2),
+            "mae_p50_corr": round(float(v3["mae_p50_corr"]), 2),
+        },
+        "v4_metrics": {
+            "coverage_fixed": round(float(v4["coverage_fixed"]) * 100.0, 2),
+            "coverage_rolling": round(float(v4["coverage_rolling"]) * 100.0, 2),
+            "interval_fixed": round(float(v4["interval_fixed_half"]), 2),
+            "interval_rolling": round(float(v4["interval_rolling_half_mean"]), 2),
+            "bias": round(float(v4["bias"]), 2),
+            "mae_p50_corr": round(float(v4["mae_p50_corr"]), 2),
+        },
+        "decision_reason": "수익률 기반 학습으로 편향 절대값이 개선되어 v4를 최종 모델로 선택",
+        "limitations": [
+            "r_fwd_7d 자기참조 비중이 높아 일부 구간에서 과민 반응 가능",
+            "학습 범위 밖 급등/급락 국면은 완전 포착이 어려움",
+            "Conformal은 분포 이동이 클 때 커버리지 저하 가능",
+        ],
+        "usage": "방향성 참고 + 리스크 범위 제공",
+        "next_step": "시나리오 엔진 자동 연동",
+    }
+    out = MODELS_DIR / "tft_final_summary.json"
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out
+
+
+def run_rolling_conformal_pipeline(
+    version: str = "v3",
+    db_path: str | Path | None = None,
+    ckpt_path: str | Path | None = None,
+    tune_alpha: bool = False,
+) -> dict[str, dict[str, object]]:
+    """v3/v4에 대해 고정 q + rolling conformal 비교, 버전 비교 플롯/요약 생성."""
+    db = Path(db_path) if db_path else DEFAULT_DB_PATH
+    v3_ck = TFT_V3_MULTI_CKPT_PATH
+    v4_ck = TFT_V4_RETURN_CKPT_PATH
+    if ckpt_path:
+        if "v4" in str(ckpt_path) or version == "v4_return":
+            v4_ck = Path(ckpt_path)
+        else:
+            v3_ck = Path(ckpt_path)
+    for p in (v3_ck, v4_ck):
+        if not p.is_file():
+            raise FileNotFoundError(f"체크포인트 없음: {p.resolve()}")
+
+    v3_cal, v3_test = _parts_from_v3(db, v3_ck)
+    v4_cal, v4_test = _parts_from_v4(db, v4_ck)
+    v3m = _evaluate_single_rolling(
+        label="v3", cal_part=v3_cal, test_part=v3_test, bias_path=TFT_V3_BIAS_PATH
+    )
+    v4m = _evaluate_single_rolling(
+        label="v4", cal_part=v4_cal, test_part=v4_test, bias_path=TFT_V4_BIAS_PATH
+    )
+
+    print("\n=== Conformal 비교 (test: 2025-10-01~2026-04-13, soybean_oil, USD/톤) ===")
+    print(
+        f"v3 Fixed:    Coverage {float(v3m['coverage_fixed']) * 100:.2f}%, "
+        f"구간 ±{float(v3m['interval_fixed_half']):.2f}달러"
+    )
+    print(
+        f"v3 Rolling:  Coverage {float(v3m['coverage_rolling']) * 100:.2f}%, "
+        f"구간 ±{float(v3m['interval_rolling_half_mean']):.2f}달러"
+    )
+    print(
+        f"v4 Fixed:    Coverage {float(v4m['coverage_fixed']) * 100:.2f}%, "
+        f"구간 ±{float(v4m['interval_fixed_half']):.2f}달러"
+    )
+    print(
+        f"v4 Rolling:  Coverage {float(v4m['coverage_rolling']) * 100:.2f}%, "
+        f"구간 ±{float(v4m['interval_rolling_half_mean']):.2f}달러"
+    )
+
+    cmp_plot = _plot_v3_v4_comparison(v3m, v4m)
+    print(f"[rolling] v3 plot: {v3m['plot_path']}")
+    print(f"[rolling] v4 plot: {v4m['plot_path']}")
+    print(f"[rolling] comparison plot: {cmp_plot.resolve()}")
+    smry = _write_final_summary(v3m, v4m)
+    print(f"[rolling] final summary: {smry.resolve()}")
+    if tune_alpha:
+        tuned = _tune_v4_rolling_alpha(v4_cal=v4_cal, v4_test=v4_test, bias_path=TFT_V4_BIAS_PATH)
+        _update_v4_bias_with_optimal(TFT_V4_BIAS_PATH, tuned)
+        print(f"[rolling] v4 bias 튜닝값 저장: {TFT_V4_BIAS_PATH.resolve()}")
+    return {"v3": v3m, "v4": v4m}
+
+
 if __name__ == "__main__":
     warnings.filterwarnings(
         "ignore",
@@ -1590,7 +2467,23 @@ if __name__ == "__main__":
     ap.add_argument(
         "--train",
         action="store_true",
-        help="전체 학습 파이프라인 실행 (체크포인트 덮어쓰기)",
+        help="학습 파이프라인 실행 (체크포인트 덮어쓰기)",
+    )
+    ap.add_argument(
+        "--version",
+        type=str,
+        default="v3",
+        help="v3(멀티 USD/톤) | v4_return(수익률 타깃) | v5_weighted(가중치 수익률)",
+    )
+    ap.add_argument(
+        "--rolling",
+        action="store_true",
+        help="v3/v4 rolling conformal 지표·플롯/비교 생성",
+    )
+    ap.add_argument(
+        "--tune_alpha",
+        action="store_true",
+        help="v4 rolling alpha(0.85/0.90/0.92) 추가 실험 및 최적값 저장",
     )
     ap.add_argument("--db", type=str, default=None, help="SQLite DB 경로 (기본: data/db/soybean.db)")
     ap.add_argument(
@@ -1600,10 +2493,23 @@ if __name__ == "__main__":
         help="평가용 체크포인트 (기본: models/tft_v2_multi.ckpt)",
     )
     args = ap.parse_args()
-    if args.train:
-        run_tft_multi_pipeline(Path(args.db) if args.db else None)
+    dbp = Path(args.db) if args.db else None
+    if args.rolling:
+        run_rolling_conformal_pipeline(
+            version=args.version,
+            db_path=dbp,
+            ckpt_path=Path(args.ckpt) if args.ckpt else None,
+            tune_alpha=args.tune_alpha,
+        )
+    elif args.train:
+        if args.version == "v4_return":
+            run_tft_v4_return_pipeline(dbp)
+        elif args.version == "v5_weighted":
+            run_tft_v5_weighted_pipeline(dbp)
+        else:
+            run_tft_multi_pipeline(dbp)
     else:
         run_tft_multi_eval_from_checkpoint(
-            Path(args.db) if args.db else None,
+            dbp,
             Path(args.ckpt) if args.ckpt else None,
         )

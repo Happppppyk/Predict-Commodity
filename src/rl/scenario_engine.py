@@ -40,6 +40,7 @@ class ScenarioRequest:
     quantity_ton: float
     monthly_consumption_ton: float
     open_po_ton: float = 0.0
+    forecast_unit: str = "cbot"  # "cbot" | "usd_per_ton"
 
 
 def _parse_date(s: str) -> date:
@@ -265,6 +266,8 @@ def evaluate_procurement_scenario(
         raise ValueError("quantity_ton, monthly_consumption_ton은 양수여야 합니다.")
     if forecast.p10 > forecast.p50 or forecast.p50 > forecast.p90:
         raise ValueError("분위수 순서는 p10 <= p50 <= p90 이어야 합니다.")
+    if req.forecast_unit not in ("cbot", "usd_per_ton"):
+        raise ValueError("forecast_unit은 'cbot' 또는 'usd_per_ton' 이어야 합니다.")
 
     db = Path(db_path) if db_path else DEFAULT_DB_PATH
     with sqlite3.connect(str(db)) as conn:
@@ -274,12 +277,21 @@ def evaluate_procurement_scenario(
     current_price_cbot = float(ctx["current_price_cbot"])
     mkt = ctx["market_avg_price_30d"]
 
-    # TFT도 price_close 기준 학습 가정: 동일 변환
-    fc = TFTQuantileForecast(
-        p10=cbot_to_usd_per_ton(forecast.p10),
-        p50=cbot_to_usd_per_ton(forecast.p50),
-        p90=cbot_to_usd_per_ton(forecast.p90),
-    )
+    # 입력 단위 정규화: 모든 내부 계산은 USD/톤 기준
+    if req.forecast_unit == "cbot":
+        fc = TFTQuantileForecast(
+            p10=cbot_to_usd_per_ton(forecast.p10),
+            p50=cbot_to_usd_per_ton(forecast.p50),
+            p90=cbot_to_usd_per_ton(forecast.p90),
+        )
+        forecast_unit_desc = "CBOT → USD/톤 변환"
+    else:
+        fc = TFTQuantileForecast(
+            p10=float(forecast.p10),
+            p50=float(forecast.p50),
+            p90=float(forecast.p90),
+        )
+        forecast_unit_desc = "TFT USD/톤 직접 입력"
 
     inv = float(req.current_inventory_ton)
     open_po = float(req.open_po_ton)
@@ -380,6 +392,7 @@ def evaluate_procurement_scenario(
             f"50일 후 예상가 — 하단(P10): {fc.p10:,.0f}달러/톤 / "
             f"중간(P50): {fc.p50:,.0f}달러/톤 / 상단(P90): {fc.p90:,.0f}달러/톤"
         ),
+        "forecast_unit": forecast_unit_desc,
         "price_direction": direction,
         "recommendation": rec,
         "reason": _reason_text(
@@ -413,6 +426,8 @@ def evaluate_procurement_scenario(
         "current_price": round(current_price, 6),
         "market_avg_price_30d": None if mkt is None else round(float(mkt), 6),
         "forecast": {"p10": fc.p10, "p50": fc.p50, "p90": fc.p90},
+        "forecast_unit": req.forecast_unit,
+        "forecast_unit_desc": forecast_unit_desc,
         "forecast_cbot": {"p10": forecast.p10, "p50": forecast.p50, "p90": forecast.p90},
         "current_inventory_ton": inv,
         "open_po_ton": open_po,

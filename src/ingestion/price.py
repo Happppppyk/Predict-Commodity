@@ -16,14 +16,14 @@ logger = logging.getLogger("src.ingestion.price")
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "db" / "soybean.db"
 DEFAULT_START_DATE = "2010-01-01"
 
-# (SQLite 테이블명, Yahoo 티커, commodity 컬럼 값, 실패 시 빈 테이블만 허용 여부)
+# (SQLite 테이블명, Yahoo 티커, commodity 컬럼 값)
+# KPO=F는 Yahoo Finance 미지원(또는 불안정)으로 스펙에서 제거됨.
+# 팜유는 Investing.com CPOc1 수동 CSV로만 적재: data/raw/palm_oil_cpo.csv → raw_palm_oil
 FUTURES_SPECS: list[dict[str, Any]] = [
-    {"table": "raw_price_futures", "ticker": "ZL=F", "commodity": "ZL=F", "optional": False},
-    {"table": "raw_crude_oil", "ticker": "CL=F", "commodity": "CL=F", "optional": False},
-    {"table": "raw_soybean_futures", "ticker": "ZS=F", "commodity": "ZS=F", "optional": False},
-    {"table": "raw_soymeal_futures", "ticker": "ZM=F", "commodity": "ZM=F", "optional": False},
-    # 팜유(FCPO): Yahoo 심볼 KPO=F 시도 — 없거나 오류 시 빈 테이블만 두고 로그만 남김
-    {"table": "raw_palm_oil", "ticker": "KPO=F", "commodity": "KPO=F", "optional": True},
+    {"table": "raw_price_futures", "ticker": "ZL=F", "commodity": "ZL=F"},
+    {"table": "raw_crude_oil", "ticker": "CL=F", "commodity": "CL=F"},
+    {"table": "raw_soybean_futures", "ticker": "ZS=F", "commodity": "ZS=F"},
+    {"table": "raw_soymeal_futures", "ticker": "ZM=F", "commodity": "ZM=F"},
 ]
 
 # 하위 호환용 별칭
@@ -32,11 +32,15 @@ RAW_PRICE_FUTURES_TABLE = "raw_price_futures"
 
 RAW_PALM_OIL_TABLE = "raw_palm_oil"
 PALM_OIL_CSV_COMMODITY = "CPOc1"
-PALM_OIL_CSV_DEFAULT_PATH = Path(__file__).resolve().parents[2] / "data" / "raw" / "palm_oil.csv"
+PALM_OIL_CSV_DEFAULT_PATH = (
+    Path(__file__).resolve().parents[2] / "data" / "raw" / "palm_oil_cpo.csv"
+)
 
 RAW_CANOLA_OIL_TABLE = "raw_canola_oil"
 CANOLA_COMMODITY_DEFAULT = "RSc1"
-CANOLA_OIL_CSV_DEFAULT_PATH = Path(__file__).resolve().parents[2] / "data" / "raw" / "canola_oil.csv"
+CANOLA_OIL_CSV_DEFAULT_PATH = (
+    Path(__file__).resolve().parents[2] / "data" / "raw" / "canola_oil_rsc1.csv"
+)
 
 RAW_CANOLA_OIL_DDL = f"""
 CREATE TABLE IF NOT EXISTS {RAW_CANOLA_OIL_TABLE} (
@@ -239,8 +243,6 @@ def ingest_one_future_to_sqlite(
     commodity: str,
     start: str,
     end_exclusive: str,
-    *,
-    optional: bool = False,
 ) -> int:
     """
     단일 티커를 내려받아 테이블에 적재한다.
@@ -251,25 +253,7 @@ def ingest_one_future_to_sqlite(
         적재 시도한 행 수(INSERT OR IGNORE로 일부는 무시될 수 있음).
     """
     ensure_futures_table(conn, table)
-    if optional:
-        try:
-            df = fetch_yahoo_futures_ohlcv(ticker, start=start, end=end_exclusive)
-        except Exception as e:
-            logger.warning(
-                "팜유(KPO=F) Yahoo Finance 수집 실패 — 빈 테이블만 유지합니다: %s: %s",
-                type(e).__name__,
-                e,
-            )
-            return 0
-        if df.empty:
-            logger.warning(
-                "팜유(KPO=F) Yahoo Finance에서 데이터가 비었습니다. "
-                "심볼 미제공 또는 제한일 수 있습니다. 테이블 `%s`는 스키마만 보장합니다.",
-                table,
-            )
-            return 0
-    else:
-        df = fetch_yahoo_futures_ohlcv(ticker, start=start, end=end_exclusive)
+    df = fetch_yahoo_futures_ohlcv(ticker, start=start, end=end_exclusive)
 
     insert_futures_ohlcv_ignore(conn, table, df, commodity)
     return len(df)
@@ -303,7 +287,6 @@ def ingest_all_futures_to_sqlite(
             table = spec["table"]
             ticker = spec["ticker"]
             commodity = spec["commodity"]
-            optional = bool(spec.get("optional", False))
             n = ingest_one_future_to_sqlite(
                 conn,
                 table,
@@ -311,7 +294,6 @@ def ingest_all_futures_to_sqlite(
                 commodity,
                 start_s,
                 end_ex,
-                optional=optional,
             )
             results.append(
                 {"table": table, "ticker": ticker, "rows_fetched": n, "commodity": commodity}
@@ -535,7 +517,7 @@ def load_palm_oil_from_investing_csv(
     Parameters
     ----------
     filepath
-        기본: `data/raw/palm_oil.csv`
+        기본: `data/raw/palm_oil_cpo.csv`
 
     Returns
     -------

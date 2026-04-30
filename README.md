@@ -18,48 +18,96 @@
 | `tests/` | 단위·통합 테스트 |
 | `config/features.yaml` | 피처 버전(v1/v2/v3) 정의 |
 
+작업 디렉터리는 저장소 루트(`soybean-oil-poc`)로 두고, DB 기본값은 `data/db/soybean.db`임.
+
 ## 실행 순서
 
-작업 디렉터리는 저장소 루트(`soybean-oil-poc`)로 두고, 아래는 모두 그 기준 경로임. DB 기본값은 `data/db/soybean.db`임.
+### 환경 설정
 
-### 전체 파이프라인(권장 순서)
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-1. 로컬 설정(venv, `pip install -r requirements.txt`) 후 활성화함.
-2. 데이터 수집으로 `raw_*` 채움.
-3. `master_daily` 빌드함.
-4. 예측 모델(XGBoost, TFT 등) 실행함.
-5. XAI·노트북은 예측·피처가 준비된 뒤 선택 실행함.
-6. 조달 시나리오 엔진은 DB·TFT 예측 입력이 있으면 바로 실행 가능함.
+### 1. 데이터 수집
 
-### 데이터 수집(`src/ingestion/`)
+```bash
+python src/ingestion/run_ingestion.py
+```
 
-- 한 번에 돌릴 때: `python src/ingestion/run_ingestion.py` (선물·매크로·CFTC·WASDE·뉴스·SAP 등 순서대로 호출됨).
-- 뉴스(GDELT) 단계를 강제로 켜려면 환경변수 `NEWS_INGESTION_API_KEY`를 비어 있지 않게 설정함. 비어 있으면 뉴스 적재는 스킵됨.
+- Yahoo Finance: 대두유/원유/대두/대두박/환율/DXY/VIX
+- FRED: 금리(FEDFUNDS)
+- CFTC: 투기 포지션
+- USDA: WASDE PSD 벌크 CSV (`data/raw/wasde_psd.csv`)
+- 수동 CSV 필요: 팜유(CPOc1), 카놀라(RSc1)  
+  → `data/raw/palm_oil_cpo.csv`  
+  → `data/raw/canola_oil_rsc1.csv`
+
+- 뉴스(GDELT) 단계를 켜려면 환경변수 `NEWS_INGESTION_API_KEY`를 비어 있지 않게 설정함. 비어 있으면 뉴스 적재는 스킵됨.
 - WASDE는 `data/raw/wasde_psd.csv`가 있으면 CSV로 재적재하고, 없으면 USDA Open Data API(`.env`의 `USDA_OPEN_DATA_API_KEY` 등) 경로로 적재 시도함.
 - SAP·World Bank 엑셀 등은 `data/raw/`에 파일이 있어야 해당 `raw_*`가 채워짐.
-- 개별 소스만 갱신할 때는 각 모듈의 `if __name__ == "__main__"` 블록을 참고함(`price.py`, `macro.py`, `cftc.py`, `wasde.py`, `news_scorer.py` 등).
+- raw + `master_daily`만 빠르게: `bash scripts/rebuild_pipeline.sh` — `run_ingestion.py` 다음 `build_master.py`를 연속 실행하고, 일부 테이블 행 수를 출력함.
 
-### 피처(`master_daily`)
+### 2. master_daily 빌드
 
-- `python src/features/build_master.py` — `raw_*`와 `config/features.yaml`을 읽어 `master_daily`를 갱신함.
+```bash
+python src/features/build_master.py
+```
 
-### 예측 모델(`src/models/`)
+- 모든 `raw_*` 테이블 통합
+- 파생 피처 계산 (lag, MA, crush_spread 등)
+- USD/톤 변환 컬럼 추가
+- 결과: `master_daily` (4,092행, 91컬럼+)
 
-- XGBoost 기본 학습·평가: `python src/models/xgboost_model.py` (옵션: `--version`, `--target` 등 `argparse` 도움말 참고).
-- 추가 실험 플래그는 같은 파일에 정의됨(예: `--tuned`, `--walkforward`, `--rerun-v1-stationary`, `--v2-interview-exp`, `--challenge-070`, `--save-ensemble-final` 등).
-- TFT(멀티 시계열): `python src/models/tft_model.py` — 기본은 저장된 체크포인트로 재평가함. 전체 재학습·체크포인트 덮어쓰기는 `--train` 사용함.
+### 3. XGBoost 앙상블 학습
 
-### XAI(`src/xai/`)
+```bash
+python src/models/xgboost_model.py
+```
 
-- TreeSHAP 등: `python src/xai/shap_explainer.py` — DB와 저장된 XGBoost 모델을 전제로 함. XGB 파이프라인 이후 실행하는 편이 자연스러함.
+- v3_clean t28 기준
+- XGBoost + LightGBM + CatBoost 앙상블
+- 저장: `models/ensemble_v3_clean_t28_final/`
 
-### 조달 시나리오(`src/rl/scenario_engine.py`)
+### 4. TFT 멀티 시계열 학습
 
-- TFT 분위수 예측과 `master_daily` 맥락을 받아 Buy/Split/Wait 권고 JSON을 생성함. 테스트: `PYTHONPATH=src python3 tests/test_scenarios.py`.
+```bash
+PYTHONPATH=src python3 src/models/tft_model.py --train
+```
 
-### raw + `master_daily`만 빠르게
+- 6개 품목 동시 학습 (USD/톤 단위)
+- 저장: `models/tft_v3_multi.ckpt`
 
-- `bash scripts/rebuild_pipeline.sh` — `run_ingestion.py` 다음 `build_master.py`를 연속 실행하고, 일부 테이블 행 수를 출력함.
+### 5. 시나리오 엔진 테스트
+
+```bash
+PYTHONPATH=src python3 tests/test_scenarios.py
+```
+
+- 현업 입력 3가지 기반 Buy/Split/Wait 권고
+- `decision_log` 테이블에 결과 저장
+
+데모(단일 JSON 출력 + DB 저장): `PYTHONPATH=src python3 scripts/run_demo.py`
+
+### 6. SHAP 설명
+
+```bash
+python src/xai/shap_explainer.py
+```
+
+- DB와 저장된 XGBoost 모델을 전제로 함. XGB 파이프라인 이후 실행하는 편이 자연스러움.
+
+### 데이터 소스별 수동 업데이트 주기
+
+| 데이터 | 주기 | 방법 |
+|--------|------|------|
+| Yahoo Finance | 자동 (매일) | `run_ingestion.py` |
+| FRED | 자동 (월별) | `run_ingestion.py` |
+| CFTC | 자동 (주별) | `run_ingestion.py` |
+| WASDE | 월 1회 수동 | CSV 교체 후 `run_ingestion.py` |
+| 팜유 CPOc1 | 월 1회 수동 | CSV 교체 후 `run_ingestion.py` |
+| 카놀라 RSc1 | 월 1회 수동 | CSV 교체 후 `run_ingestion.py` |
 
 ## Look-ahead 방지·조인 규칙
 
@@ -93,13 +141,3 @@
 - Yahoo 등 일별 관측은 해당 일자 확정분으로 봄. 주말·휴장일은 직전 관측일로 forward-fill하며, 보간 행은 `is_interpolated=1` 등으로 구분 가능함(신규 시장 정보가 아님).
 - `master_daily`에서는 관측일만 쓸지·보간 행을 제외할지 정책으로 통제함.
 - forward-fill은 과거→현재만 사용함.
-
-
-## 로컬 설정 (예정)
-
-```bash
-cd soybean-oil-poc
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
